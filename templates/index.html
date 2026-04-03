@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Live Chess Win Predictor</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/chessboard.js/1.0.0/chessboard-1.0.0.min.js"></script>
+    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      body {
+        background:
+          radial-gradient(circle at 50% 0%, rgba(59, 130, 246, 0.24) 0%, rgba(10, 17, 35, 0) 42%),
+          radial-gradient(circle at 0% 80%, rgba(30, 64, 175, 0.16) 0%, rgba(10, 17, 35, 0) 40%),
+          #060c1a;
+        font-feature-settings: "tnum";
+      }
+      .tv-shell {
+        background: linear-gradient(160deg, rgba(27, 31, 40, 0.96), rgba(16, 20, 28, 0.92));
+        border: 1px solid rgba(148, 163, 184, 0.18);
+        box-shadow: 0 30px 85px rgba(0, 0, 0, 0.55);
+      }
+      .prob-segment {
+        transition: width 550ms cubic-bezier(0.4, 0, 0.2, 1);
+      }
+      .chip {
+        border: 1px solid rgba(148, 163, 184, 0.25);
+        background: rgba(15, 23, 42, 0.65);
+      }
+      .board-shell {
+        width: 100%;
+        border: 8px solid #171c25;
+        background: #171c25;
+        border-radius: 10px;
+        overflow: hidden;
+        position: relative;
+      }
+      #board {
+        width: 100%;
+        height: min(82vw, 760px);
+        min-height: 500px;
+        border: 0;
+        display: block;
+      }
+      .prob-vertical-segment {
+        transition: height 550ms cubic-bezier(0.4, 0, 0.2, 1);
+      }
+      .board-predictor-layout {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 1rem;
+      }
+      @media (min-width: 1280px) {
+        .board-predictor-layout {
+          grid-template-columns: minmax(0, 1fr) 96px;
+          align-items: start;
+        }
+      }
+    </style>
+  </head>
+  <body class="min-h-screen text-slate-100">
+    <main class="mx-auto flex min-h-screen w-full max-w-6xl items-center justify-center px-4 py-6">
+      <section class="tv-shell w-full rounded-3xl p-5 sm:p-8">
+        <div class="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h1 class="text-3xl font-semibold tracking-tight text-slate-100 sm:text-4xl">
+              Grandmaster Live TV
+            </h1>
+            <p class="mt-1 text-sm text-slate-300">
+              Live Lichess game with move-by-move win prediction
+            </p>
+          </div>
+          <div class="flex items-center gap-2 text-xs">
+            <span id="connDot" class="h-2.5 w-2.5 rounded-full bg-amber-400"></span>
+            <span id="connText" class="chip rounded-full px-3 py-1.5 text-slate-200">Connecting...</span>
+            <span id="lastUpdate" class="chip rounded-full px-3 py-1.5 text-slate-300">No updates yet</span>
+          </div>
+        </div>
+
+        <div class="mt-6 grid grid-cols-1 gap-3 md:grid-cols-2">
+          <div class="chip flex items-center gap-3 rounded-xl px-4 py-3">
+            <span class="text-3xl text-slate-300">◯</span>
+            <div>
+              <p class="text-xs uppercase tracking-wide text-slate-400">White</p>
+              <p id="whiteName" class="text-lg font-semibold text-slate-100 sm:text-2xl">Waiting...</p>
+            </div>
+          </div>
+          <div class="chip flex items-center gap-3 rounded-xl px-4 py-3">
+            <span class="text-3xl text-slate-300">⬤</span>
+            <div>
+              <p class="text-xs uppercase tracking-wide text-slate-400">Black</p>
+              <p id="blackName" class="text-lg font-semibold text-slate-100 sm:text-2xl">Waiting...</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="board-predictor-layout mt-5">
+          <div>
+            <div class="board-shell rounded-sm">
+              <iframe
+                id="board"
+                title="Lichess TV Live Board"
+                src="https://lichess.org/tv/frame?theme=brown&bg=dark"
+                allowfullscreen
+              ></iframe>
+            </div>
+          </div>
+
+          <aside class="flex justify-center">
+            <div id="probBar" class="flex w-20 flex-col overflow-hidden rounded-3xl text-center text-lg font-bold">
+              <div id="whiteBar" class="prob-vertical-segment flex w-full items-center justify-center bg-neutral-200 text-black" style="height: 33.33%">
+                <span id="whiteLabel">33.3%</span>
+              </div>
+              <div id="drawBar" class="prob-vertical-segment flex w-full items-center justify-center bg-neutral-500 text-white" style="height: 33.33%">
+                <span id="drawLabel">33.3%</span>
+              </div>
+              <div id="blackBar" class="prob-vertical-segment flex w-full items-center justify-center bg-neutral-800 text-white" style="height: 33.34%">
+                <span id="blackLabel">33.4%</span>
+              </div>
+            </div>
+          </aside>
+        </div>
+        <div class="mt-3 flex items-center justify-between rounded-xl border border-slate-700/70 bg-slate-900/40 px-4 py-2 text-sm">
+          <span class="text-slate-300">White Win: <strong id="whiteLabelBottom" class="text-slate-100">33.3%</strong></span>
+          <span class="text-slate-300">Draw: <strong id="drawLabelBottom" class="text-slate-100">33.3%</strong></span>
+          <span class="text-slate-300">Black Win: <strong id="blackLabelBottom" class="text-slate-100">33.4%</strong></span>
+        </div>
+        <p class="mt-3 text-center text-xs text-slate-400">Board source: Lichess TV embed</p>
+      </section>
+    </main>
+
+    <script>
+      function setProbabilities(white, draw, black) {
+        const wp = Math.max(0, Number((white * 100).toFixed(1)));
+        const dp = Math.max(0, Number((draw * 100).toFixed(1)));
+        const bp = Math.max(0, Number((black * 100).toFixed(1)));
+
+        document.getElementById("whiteBar").style.height = `${wp}%`;
+        document.getElementById("drawBar").style.height = `${dp}%`;
+        document.getElementById("blackBar").style.height = `${bp}%`;
+
+        document.getElementById("whiteLabel").textContent = `${wp}%`;
+        document.getElementById("drawLabel").textContent = `${dp}%`;
+        document.getElementById("blackLabel").textContent = `${bp}%`;
+        document.getElementById("whiteLabelBottom").textContent = `${wp}%`;
+        document.getElementById("drawLabelBottom").textContent = `${dp}%`;
+        document.getElementById("blackLabelBottom").textContent = `${bp}%`;
+      }
+
+      let currentGameId = null;
+      const boardFrame = document.getElementById("board");
+      const probBar = document.getElementById("probBar");
+      const connDot = document.getElementById("connDot");
+      const connText = document.getElementById("connText");
+      const lastUpdate = document.getElementById("lastUpdate");
+
+      function syncBarHeight() {
+        if (!boardFrame || !probBar) return;
+        const h = boardFrame.offsetHeight;
+        if (h > 0) {
+          probBar.style.height = `${h}px`;
+        }
+      }
+
+      const socket = io();
+
+      socket.on("connect", () => {
+        connDot.className = "h-2.5 w-2.5 rounded-full bg-emerald-400";
+        connText.textContent = "Live";
+        syncBarHeight();
+      });
+
+      socket.on("position_update", (data) => {
+        if (data.game_id && data.game_id !== currentGameId) {
+          currentGameId = data.game_id;
+          boardFrame.src = `https://lichess.org/embed/game/${data.game_id}?theme=brown&bg=dark`;
+        }
+
+        document.getElementById("whiteName").textContent =
+          data.white_player || "Waiting...";
+        document.getElementById("blackName").textContent =
+          data.black_player || "Waiting...";
+
+        if (data.probabilities) {
+          setProbabilities(
+            data.probabilities.white || 0,
+            data.probabilities.draw || 0,
+            data.probabilities.black || 0
+          );
+        }
+        const now = new Date();
+        lastUpdate.textContent = `Updated ${now.toLocaleTimeString()}`;
+        syncBarHeight();
+      });
+
+      socket.on("disconnect", () => {
+        connDot.className = "h-2.5 w-2.5 rounded-full bg-rose-400";
+        connText.textContent = "Disconnected";
+      });
+
+      boardFrame.addEventListener("load", syncBarHeight);
+      window.addEventListener("resize", syncBarHeight);
+    </script>
+  </body>
+</html>
