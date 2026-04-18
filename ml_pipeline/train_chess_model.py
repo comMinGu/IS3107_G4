@@ -25,7 +25,15 @@ import numpy as np
 import pandas as pd
 import requests
 import zstandard as zstd
-from sklearn.metrics import accuracy_score, classification_report, log_loss
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+    f1_score,
+    log_loss,
+    precision_score,
+    recall_score,
+)
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
@@ -33,6 +41,15 @@ try:
     import lightgbm as lgb
 except ImportError as exc:
     raise ImportError("LightGBM is required for this script. Run `pip install lightgbm`.") from exc
+
+try:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+except ImportError as exc:
+    raise ImportError("Matplotlib is required for PDF report generation. Run `pip install matplotlib`.") from exc
 
 
 TARGET_FILTERED_GAMES = 2000
@@ -75,6 +92,10 @@ class TrainingArtifacts:
     label_order: List[str]
     label_to_id: Dict[str, int]
     metrics: Dict[str, float]
+    classification_report_df: pd.DataFrame
+    confusion_matrix_df: pd.DataFrame
+    feature_importance_df: pd.DataFrame
+    test_game_class_distribution: pd.Series
 
 
 def parse_args() -> argparse.Namespace:
@@ -593,8 +614,15 @@ def train_model(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFr
     metrics = {
         "validation_log_loss": float(log_loss(y_val, val_proba, labels=[0, 1, 2])),
         "validation_accuracy": float(accuracy_score(y_val, val_pred)),
+        "validation_macro_precision": float(precision_score(y_val, val_pred, average="macro", zero_division=0)),
+        "validation_macro_recall": float(recall_score(y_val, val_pred, average="macro", zero_division=0)),
+        "validation_macro_f1": float(f1_score(y_val, val_pred, average="macro", zero_division=0)),
         "test_log_loss": float(log_loss(y_test, test_proba, labels=[0, 1, 2])),
         "test_accuracy": float(accuracy_score(y_test, test_pred)),
+        "test_macro_precision": float(precision_score(y_test, test_pred, average="macro", zero_division=0)),
+        "test_macro_recall": float(recall_score(y_test, test_pred, average="macro", zero_division=0)),
+        "test_macro_f1": float(f1_score(y_test, test_pred, average="macro", zero_division=0)),
+        "test_weighted_f1": float(f1_score(y_test, test_pred, average="weighted", zero_division=0)),
     }
 
     print("Validation log loss:", metrics["validation_log_loss"])
@@ -604,11 +632,41 @@ def train_model(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFr
     print("\nTest classification report:")
     print(classification_report(y_test, test_pred, target_names=LABEL_ORDER))
 
+    classification_report_dict = classification_report(
+        y_test,
+        test_pred,
+        target_names=LABEL_ORDER,
+        output_dict=True,
+        zero_division=0,
+    )
+    classification_report_rows = [
+        {**classification_report_dict[label], "label": label}
+        for label in LABEL_ORDER
+        if label in classification_report_dict
+    ]
+    for summary_label in ["macro avg", "weighted avg"]:
+        if summary_label in classification_report_dict:
+            classification_report_rows.append(
+                {**classification_report_dict[summary_label], "label": summary_label}
+            )
+    classification_report_df = pd.DataFrame(classification_report_rows).set_index("label")
+    classification_report_df.index.name = "label"
+
+    confusion_matrix_df = pd.DataFrame(
+        confusion_matrix(y_test, test_pred, labels=[0, 1, 2]),
+        index=LABEL_ORDER,
+        columns=LABEL_ORDER,
+    )
+
     feature_importance_df = pd.DataFrame(
         {"feature": FEATURE_COLS, "importance": lgbm_model.feature_importances_}
     ).sort_values("importance", ascending=False)
     print("\nFeature importance:")
     print(feature_importance_df.to_string(index=False))
+
+    test_game_class_distribution = (
+        test_df.groupby("game_id")["label"].first().value_counts().reindex(LABEL_ORDER, fill_value=0)
+    )
 
     return TrainingArtifacts(
         model=lgbm_model,
@@ -617,7 +675,125 @@ def train_model(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFr
         label_order=LABEL_ORDER,
         label_to_id={label: idx for idx, label in enumerate(LABEL_ORDER)},
         metrics=metrics,
+        classification_report_df=classification_report_df,
+        confusion_matrix_df=confusion_matrix_df,
+        feature_importance_df=feature_importance_df,
+        test_game_class_distribution=test_game_class_distribution,
     )
+
+
+def build_report_path(artifact_path: str, run_date: date) -> Path:
+    artifact_file = Path(artifact_path)
+    return artifact_file.parent / "reports" / f"chess_model_report_{run_date.isoformat()}.pdf"
+
+
+def save_pdf_report(
+    artifacts: TrainingArtifacts,
+    artifact_path: str,
+    run_date: date,
+    broadcast_urls: List[str],
+) -> None:
+    report_path = build_report_path(artifact_path, run_date)
+    # Save the human-readable report next to the local artifact output under
+    # `artifacts/reports/`, creating the folder automatically for each teammate.
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+
+    summary_metrics_df = pd.DataFrame(
+        [
+            ("Validation Accuracy", artifacts.metrics["validation_accuracy"]),
+            ("Validation Macro Precision", artifacts.metrics["validation_macro_precision"]),
+            ("Validation Macro Recall", artifacts.metrics["validation_macro_recall"]),
+            ("Validation Macro F1", artifacts.metrics["validation_macro_f1"]),
+            ("Validation Log Loss", artifacts.metrics["validation_log_loss"]),
+            ("Test Accuracy", artifacts.metrics["test_accuracy"]),
+            ("Test Macro Precision", artifacts.metrics["test_macro_precision"]),
+            ("Test Macro Recall", artifacts.metrics["test_macro_recall"]),
+            ("Test Macro F1", artifacts.metrics["test_macro_f1"]),
+            ("Test Weighted F1", artifacts.metrics["test_weighted_f1"]),
+            ("Test Log Loss", artifacts.metrics["test_log_loss"]),
+        ],
+        columns=["Metric", "Value"],
+    )
+    summary_metrics_df["Value"] = summary_metrics_df["Value"].map(lambda value: f"{value:.4f}")
+
+    class_report_df = artifacts.classification_report_df.copy()
+    numeric_cols = ["precision", "recall", "f1-score", "support"]
+    for col in numeric_cols:
+        if col in class_report_df.columns:
+            if col == "support":
+                class_report_df[col] = class_report_df[col].fillna(0).round(0).astype(int)
+            else:
+                class_report_df[col] = class_report_df[col].fillna(0).map(lambda value: f"{value:.4f}")
+
+    with PdfPages(report_path) as pdf:
+        fig, axes = plt.subplots(2, 1, figsize=(8.27, 11.69))
+        fig.suptitle("Chess Model Retraining Report", fontsize=16, fontweight="bold")
+
+        axes[0].axis("off")
+        header_lines = [
+            f"Run date: {run_date.isoformat()}",
+            f"Model artifact: {Path(artifact_path).as_posix()}",
+            f"Feature set: {', '.join(artifacts.feature_cols)}",
+            f"Broadcast files used: {len(broadcast_urls)}",
+        ]
+        axes[0].text(0.0, 0.95, "\n".join(header_lines), va="top", fontsize=10)
+        summary_table = axes[0].table(
+            cellText=summary_metrics_df.values,
+            colLabels=summary_metrics_df.columns,
+            cellLoc="left",
+            colLoc="left",
+            bbox=[0.0, 0.0, 1.0, 0.72],
+        )
+        summary_table.auto_set_font_size(False)
+        summary_table.set_fontsize(9)
+
+        axes[1].axis("off")
+        class_report_table = axes[1].table(
+            cellText=class_report_df.reset_index().values,
+            colLabels=["label", *class_report_df.columns.tolist()],
+            cellLoc="center",
+            colLoc="center",
+            bbox=[0.0, 0.0, 1.0, 0.95],
+        )
+        class_report_table.auto_set_font_size(False)
+        class_report_table.set_fontsize(8)
+        axes[1].set_title("Test Classification Report", fontsize=12, pad=10)
+        fig.tight_layout(rect=[0, 0, 1, 0.97])
+        pdf.savefig(fig)
+        plt.close(fig)
+
+        fig, axes = plt.subplots(1, 3, figsize=(14, 4.8))
+
+        confusion = artifacts.confusion_matrix_df.to_numpy()
+        heatmap = axes[0].imshow(confusion, cmap="Blues")
+        axes[0].set_title("Confusion Matrix")
+        axes[0].set_xticks(range(len(artifacts.label_order)))
+        axes[0].set_xticklabels(artifacts.label_order, rotation=45, ha="right")
+        axes[0].set_yticks(range(len(artifacts.label_order)))
+        axes[0].set_yticklabels(artifacts.label_order)
+        axes[0].set_xlabel("Predicted")
+        axes[0].set_ylabel("Actual")
+        for i in range(confusion.shape[0]):
+            for j in range(confusion.shape[1]):
+                axes[0].text(j, i, int(confusion[i, j]), ha="center", va="center", color="black")
+        fig.colorbar(heatmap, ax=axes[0], fraction=0.046, pad=0.04)
+
+        feature_importance_df = artifacts.feature_importance_df.sort_values("importance", ascending=True)
+        axes[1].barh(feature_importance_df["feature"], feature_importance_df["importance"], color="#4C78A8")
+        axes[1].set_title("Feature Importance")
+        axes[1].set_xlabel("Importance")
+
+        class_distribution = artifacts.test_game_class_distribution.reindex(artifacts.label_order, fill_value=0)
+        axes[2].bar(class_distribution.index, class_distribution.values, color="#72B7B2")
+        axes[2].set_title("Test Game Class Distribution")
+        axes[2].set_ylabel("Games")
+        axes[2].tick_params(axis="x", rotation=30)
+
+        fig.tight_layout()
+        pdf.savefig(fig)
+        plt.close(fig)
+
+    print("Saved PDF report to:", report_path.as_posix())
 
 
 def save_model_bundle(
@@ -627,6 +803,9 @@ def save_model_bundle(
     broadcast_urls: List[str],
 ) -> None:
     artifact_file = Path(artifact_path)
+    # Create `artifacts/` automatically inside the local project checkout so
+    # teammates can run the pipeline from different repo locations without
+    # changing any machine-specific paths.
     artifact_file.parent.mkdir(parents=True, exist_ok=True)
 
     model_bundle = {
@@ -680,6 +859,12 @@ def main(run_date: Optional[str] = None, artifact_path: str = "artifacts/chess_w
     model_df = engineer_features(df)
     train_df, val_df, test_df = split_games(model_df)
     training_artifacts = train_model(train_df, val_df, test_df)
+    save_pdf_report(
+        training_artifacts,
+        artifact_path=artifact_path,
+        run_date=parsed_run_date,
+        broadcast_urls=broadcast_urls,
+    )
     save_model_bundle(
         training_artifacts,
         artifact_path=artifact_path,
