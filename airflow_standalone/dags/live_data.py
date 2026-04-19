@@ -2,21 +2,105 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import timedelta
+import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 import pendulum
 from airflow.decorators import dag, task
-from airflow.providers.redis.hooks.redis import RedisHook
+from google.auth import default as google_auth_default
+from google.auth.transport.requests import AuthorizedSession
 
 log = logging.getLogger(__name__)
 
 LICHESS_TV_CHANNELS_URL = "https://lichess.org/api/tv/channels"
 LICHESS_GAME_STREAM_URL = "https://lichess.org/api/stream/game/{game_id}"
 CLOUD_EVAL_URL = "https://lichess.org/api/cloud-eval?fen={fen}"
-REDIS_CONN_ID = "redis_default"
-CURRENT_GAME_KEY = "lichess:classical:current_game"
+
+# Same values as the web client (firebase-config). Firestore writes use Cloud Composer / ADC.
+FIREBASE_CONFIG: dict[str, str] = {
+    "apiKey": "AIzaSyAf0R2DOaL1K4mUBe8LnUpniSD-2Q96pao",
+    "authDomain": "chess-win-predictor.firebaseapp.com",
+    "projectId": "chess-win-predictor",
+    "storageBucket": "chess-win-predictor.firebasestorage.app",
+    "messagingSenderId": "708542432330",
+    "appId": "1:708542432330:web:1736c9c2146332b9de92b3",
+    "measurementId": "G-0XK6XQLCPH",
+}
+
+PROJECT_ID = FIREBASE_CONFIG["projectId"]
+_FIRESTORE_SCOPES = ("https://www.googleapis.com/auth/datastore",)
+
+PREDICTIONS_COLLECTION = "predictions"
+CURRENT_CLASSICAL_DOC_ID = "_current_classical"
+
+_authorized_session: AuthorizedSession | None = None
+
+
+def _firestore_documents_root() -> str:
+    return (
+        f"https://firestore.googleapis.com/v1/projects/{PROJECT_ID}"
+        f"/databases/(default)/documents"
+    )
+
+
+def _authorized_firestore_session() -> AuthorizedSession:
+    global _authorized_session
+    if _authorized_session is None:
+        creds, _ = google_auth_default(scopes=_FIRESTORE_SCOPES)
+        _authorized_session = AuthorizedSession(creds)
+    return _authorized_session
+
+
+def _timestamp_value() -> dict[str, Any]:
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    return {"timestampValue": ts}
+
+
+def _to_firestore_value(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {"nullValue": None}
+    if isinstance(value, bool):
+        return {"booleanValue": value}
+    if isinstance(value, int) and not isinstance(value, bool):
+        return {"integerValue": str(value)}
+    if isinstance(value, float):
+        return {"doubleValue": value}
+    if isinstance(value, str):
+        return {"stringValue": value}
+    if isinstance(value, dict):
+        return {
+            "mapValue": {
+                "fields": {k: _to_firestore_value(value[k]) for k in value},
+            },
+        }
+    if isinstance(value, list):
+        return {"arrayValue": {"values": [_to_firestore_value(v) for v in value]}}
+    return {"stringValue": str(value)}
+
+
+def _patch_document(doc_rel_path: str, fields: dict[str, Any]) -> None:
+    field_paths = list(fields.keys())
+    mask = "&".join(f"updateMask.fieldPaths={quote(fp, safe='')}" for fp in field_paths)
+    url = f"{_firestore_documents_root()}/{quote(doc_rel_path, safe='')}?{mask}&allowMissing=true"
+    body = {"fields": {k: _to_firestore_value(fields[k]) for k in fields}}
+    resp = _authorized_firestore_session().patch(url, json=body, timeout=60)
+    resp.raise_for_status()
+
+
+def _create_turn_document(game_id: str, turn_doc_id: str, fields: dict[str, Any]) -> str:
+    parent_enc = quote(f"{PREDICTIONS_COLLECTION}/{game_id}", safe="")
+    url = (
+        f"{_firestore_documents_root()}/{parent_enc}/turns"
+        f"?documentId={quote(turn_doc_id, safe='')}"
+    )
+    body = {"fields": {k: _to_firestore_value(fields[k]) for k in fields}}
+    resp = _authorized_firestore_session().post(url, json=body, timeout=60)
+    resp.raise_for_status()
+    return turn_doc_id
+
 
 default_args = {
     "owner": "is3107",
@@ -100,58 +184,75 @@ def run_ml_model(record: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def get_redis():
-    return RedisHook(redis_conn_id=REDIS_CONN_ID).get_conn()
-
-
 def set_current_game_pointer(game_id: str, stream_key: str) -> None:
-    redis_client = get_redis()
-    payload = {
-        "game_id": game_id,
-        "stream_key": stream_key,
-        "channel": "classical",
-    }
-    redis_client.set(CURRENT_GAME_KEY, json.dumps(payload))
+    now = _timestamp_value()
+    _patch_document(
+        f"{PREDICTIONS_COLLECTION}/{CURRENT_CLASSICAL_DOC_ID}",
+        {
+            "game_id": game_id,
+            "stream_key": stream_key,
+            "channel": "classical",
+            "updated_at": now,
+        },
+    )
+    _patch_document(
+        f"{PREDICTIONS_COLLECTION}/{game_id}",
+        {
+            "game_id": game_id,
+            "stream_key": stream_key,
+            "channel": "classical",
+            "status": "live",
+            "created_at": now,
+            "updated_at": now,
+        },
+    )
 
 
-def publish_to_redis_stream(
+def publish_prediction_to_firestore(
+    game_id: str,
     stream_key: str,
     record: dict[str, Any],
     ml_result: dict[str, Any],
 ) -> str:
-    redis_client = get_redis()
-    entry_id = redis_client.xadd(
-        stream_key,
+    now = _timestamp_value()
+    _patch_document(
+        f"{PREDICTIONS_COLLECTION}/{game_id}",
+        {
+            "game_id": game_id,
+            "stream_key": stream_key,
+            "channel": "classical",
+            "status": "live",
+            "turn": record.get("turn"),
+            "last_move": record.get("last_move"),
+            "record": record,
+            "ml_result": ml_result,
+            "updated_at": now,
+        },
+    )
+    turn_doc_id = str(uuid.uuid4())
+    _create_turn_document(
+        game_id,
+        turn_doc_id,
         {
             "game_id": str(record["game_id"]),
-            "turn": str(record["turn"]),
-            "last_move": str(record["last_move"]),
-            "record_json": json.dumps(record),
-            "ml_result_json": json.dumps(ml_result),
+            "turn": record.get("turn"),
+            "last_move": record.get("last_move"),
+            "record": record,
+            "ml_result": ml_result,
+            "created_at": now,
         },
-        maxlen=5000,
-        approximate=True,
     )
-
-    latest_payload = {
-        "record": record,
-        "ml_result": ml_result,
-    }
-    redis_client.set(f"{stream_key}:latest", json.dumps(latest_payload))
-
-    if isinstance(entry_id, bytes):
-        entry_id = entry_id.decode("utf-8")
-    return entry_id
+    return turn_doc_id
 
 
 @dag(
     dag_id="lichess_live_data",
-    description="Continuously process current Lichess classical TV game into Redis",
+    description="Continuously process current Lichess classical TV game into Firestore",
     schedule="@continuous",
     start_date=pendulum.datetime(2024, 1, 1, tz="UTC"),
     catchup=False,
     max_active_runs=1,
-    tags=["lichess", "redis", "ml", "live"],
+    tags=["lichess", "firestore", "ml", "live"],
     default_args=default_args,
 )
 def lichess_live_data_dag():
@@ -201,7 +302,8 @@ def lichess_live_data_dag():
                 record = build_move_record(game, event)
                 ml_result = run_ml_model(record)
 
-                latest_entry_id = publish_to_redis_stream(
+                latest_entry_id = publish_prediction_to_firestore(
+                    game_id=game_id,
                     stream_key=stream_key,
                     record=record,
                     ml_result=ml_result,
@@ -211,13 +313,17 @@ def lichess_live_data_dag():
                 latest_turn = record["turn"]
 
                 log.info(
-                    "Published turn=%s game_id=%s entry_id=%s",
+                    "Published turn=%s game_id=%s turn_doc_id=%s",
                     latest_turn,
                     game_id,
                     latest_entry_id,
                 )
 
         log.info("Game stream ended for game_id=%s", game_id)
+        _patch_document(
+            f"{PREDICTIONS_COLLECTION}/{game_id}",
+            {"status": "finished", "updated_at": _timestamp_value()},
+        )
 
         return {
             "game_id": game_id,

@@ -1,0 +1,21 @@
+// Import the functions you need from the SDKs you need
+import { initializeApp } from "firebase/app";
+import { getAnalytics } from "firebase/analytics";
+// TODO: Add SDKs for Firebase products that you want to use
+// https://firebase.google.com/docs/web/setup#available-libraries
+
+// Your web app's Firebase configuration
+// For Firebase JS SDK v7.20.0 and later, measurementId is optional
+const firebaseConfig = {
+  apiKey: "AIzaSyAf0R2DOaL1K4mUBe8LnUpniSD-2Q96pao",
+  authDomain: "chess-win-predictor.firebaseapp.com",
+  projectId: "chess-win-predictor",
+  storageBucket: "chess-win-predictor.firebasestorage.app",
+  messagingSenderId: "708542432330",
+  appId: "1:708542432330:web:1736c9c2146332b9de92b3",
+  measurementId: "G-0XK6XQLCPH"
+};
+
+// Initialize Firebase
+const app = initializeApp(firebaseConfig);
+const analytics = getAnalytics(app);

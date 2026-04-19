@@ -1,0 +1,2 @@
+# live_data.py uses Firestore REST + google.auth (included with Cloud Composer / Airflow).
+# No extra PyPI packages are required for that DAG.
