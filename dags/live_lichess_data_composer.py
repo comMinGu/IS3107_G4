@@ -23,8 +23,8 @@ log = logging.getLogger(__name__)
 LICHESS_TV_CHANNELS_URL = "https://lichess.org/api/tv/channels"
 LICHESS_GAME_STREAM_URL = "https://lichess.org/api/stream/game/{game_id}"
 CLOUD_EVAL_URL = "https://lichess.org/api/cloud-eval"
-ML_ARTIFACT_PATH = os.environ.get("ML_ARTIFACT_PATH", "artifacts/chess_win_model_bundle.pkl")
-ML_ARTIFACT_URI = Variable.get("ML_ARTIFACT_URI", default_var=ML_ARTIFACT_PATH)
+ML_ARTIFACT_PATH = "/tmp/chess_win_model_bundle.pkl"
+ML_ARTIFACT_URI = "gs://us-central1-chess-win-predi-8c3082fa-bucket/chess/monthly/chess_win_model_bundle_latest.pkl"
 GCP_CONN_ID = Variable.get("GCP_CONN_ID", default_var="google_cloud_default")
 MODEL_BUNDLE_CACHE: dict[str, Any] | None = None
 POSTGRES_CONN_ID = "cloudquery_postgres"
