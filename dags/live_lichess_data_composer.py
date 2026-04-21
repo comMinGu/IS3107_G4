@@ -16,6 +16,7 @@ import pendulum
 from airflow.decorators import dag, task
 from airflow.models import Variable
 from airflow.providers.google.cloud.hooks.gcs import GCSHook
+from airflow.providers.postgres.hooks.postgres import PostgresHook
 
 log = logging.getLogger(__name__)
 
@@ -26,6 +27,8 @@ ML_ARTIFACT_PATH = os.environ.get("ML_ARTIFACT_PATH", "artifacts/chess_win_model
 ML_ARTIFACT_URI = Variable.get("ML_ARTIFACT_URI", default_var=ML_ARTIFACT_PATH)
 GCP_CONN_ID = Variable.get("GCP_CONN_ID", default_var="google_cloud_default")
 MODEL_BUNDLE_CACHE: dict[str, Any] | None = None
+POSTGRES_CONN_ID = "cloudquery_postgres"
+POSTGRES_TABLE = "lichess_move_predictions"
 
 default_args = {
     "owner": "is3107",
@@ -177,6 +180,53 @@ def invoke_ml_artifact(model_input: dict[str, Any]) -> dict[str, Any]:
         "probabilities": {label_order[idx]: float(probabilities[idx]) for idx in range(len(label_order))},
     }
 
+def upsert_prediction_result(result: dict[str, Any]) -> None:
+    hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
+    sql = f"""
+    INSERT INTO {POSTGRES_TABLE} (
+        game_id,
+        turn,
+        side_to_move,
+        ply,
+        eval_cp_clipped,
+        elo_diff,
+        time_left_seconds,
+        predicted_label,
+        probabilities,
+        created_at,
+        updated_at
+    )
+    VALUES (
+        %(game_id)s,
+        %(turn)s,
+        %(side_to_move)s,
+        %(ply)s,
+        %(eval_cp_clipped)s,
+        %(elo_diff)s,
+        %(time_left_seconds)s,
+        %(predicted_label)s,
+        %(probabilities)s::jsonb,
+        NOW(),
+        NOW()
+    )
+    ON CONFLICT (game_id, turn, side_to_move)
+    DO UPDATE SET
+        ply = EXCLUDED.ply,
+        eval_cp_clipped = EXCLUDED.eval_cp_clipped,
+        elo_diff = EXCLUDED.elo_diff,
+        time_left_seconds = EXCLUDED.time_left_seconds,
+        predicted_label = EXCLUDED.predicted_label,
+        probabilities = EXCLUDED.probabilities,
+        updated_at = NOW()
+    """
+    hook.run(
+        sql,
+        parameters={
+            **result,
+            "probabilities": json.dumps(result["probabilities"]),
+        },
+    )
+    log.info("Upserted prediction result for game_id=%s, turn=%s, side_to_move=%s", result["game_id"], result["turn"], result["side_to_move"])
 
 @dag(
     dag_id="lichess_live_data_simple_composer",
@@ -228,14 +278,29 @@ def live_data_composer_dag():
                 move_number = processed_moves + 1
                 turn = (move_number + 1) // 2
                 model_input = build_model_input(game, event, move_number=move_number)
-                probs = invoke_ml_artifact(model_input)["probabilities"]
+                                prediction = invoke_ml_artifact(model_input)
+                probs = prediction["probabilities"]
+
+                row = {
+                    "game_id": game_id,
+                    "turn": turn,
+                    "side_to_move": model_input["side_to_move"],
+                    "ply": move_number,
+                    "eval_cp_clipped": model_input["eval_cp_clipped"],
+                    "elo_diff": model_input["elo_diff"],
+                    "time_left_seconds": model_input["time_left_seconds"],
+                    "predicted_label": prediction["predicted_label"],
+                    "probabilities": probs,
+                }
+
+                upsert_prediction_result(row)
+
                 log.info(
-                    "turn=%s side_to_move=%s ml=[%.6f, %.6f, %.6f]",
+                    "stored game_id=%s turn=%s side_to_move=%s predicted=%s",
+                    game_id,
                     turn,
                     model_input["side_to_move"],
-                    probs["white_win"],
-                    probs["draw"],
-                    probs["black_win"],
+                    prediction["predicted_label"],
                 )
                 processed_moves += 1
                 latest_turn = turn
