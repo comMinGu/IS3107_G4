@@ -17,8 +17,8 @@ from airflow.models import Variable
 from airflow.operators.bash import BashOperator
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-TRAINING_SCRIPT = PROJECT_ROOT / "ml_pipeline" / "train_chess_model.py"
+DAG_DIR = Path(__file__).resolve().parent
+TRAINING_SCRIPT = DAG_DIR / "ml_pipeline" / "train_chess_model.py"
 PYTHON_BIN = sys.executable
 
 # Configure in Airflow Variables (Admin > Variables):
@@ -46,12 +46,17 @@ with DAG(
 ) as dag:
     run_monthly_retraining = BashOperator(
         task_id="run_monthly_retraining",
-        cwd=str(PROJECT_ROOT),
+        cwd=str(DAG_DIR),
         bash_command=f"""
 set -euo pipefail
 
 if [ -z "{GCS_BUCKET}" ]; then
   echo "Airflow Variable GCS_ML_ARTIFACT_BUCKET is required."
+  exit 1
+fi
+
+if [ ! -f "{TRAINING_SCRIPT}" ]; then
+  echo "Training script missing at {TRAINING_SCRIPT}"
   exit 1
 fi
 
