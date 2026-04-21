@@ -1,0 +1,11 @@
+{"timestamp":"2026-04-19T14:08:38.965461Z","level":"warning","event":"Could not import pandas. Holidays will not be considered.","logger":"airflow.example_dags.plugins.workday","filename":"workday.py","lineno":41}
+{"timestamp":"2026-04-19T14:08:38.977441Z","level":"info","event":"DAG bundles loaded: dags-folder, example_dags","logger":"airflow.dag_processing.bundles.manager.DagBundlesManager","filename":"manager.py","lineno":179}
+{"timestamp":"2026-04-19T14:08:38.977726Z","level":"info","event":"Filling up the DagBag from /Users/guptaaryan/Downloads/IS3107_G4/airflow_standalone/dags/live_data.py","logger":"airflow.models.dagbag.BundleDagBag","filename":"dagbag.py","lineno":593}
+{"timestamp":"2026-04-19T14:08:39.032594Z","level":"warning","event":"The `airflow.decorators.dag` attribute is deprecated. Please use `'airflow.sdk.dag'`.","category":"DeprecatedImportWarning","filename":"/Users/guptaaryan/Downloads/IS3107_G4/airflow_standalone/dags/live_data.py","lineno":14,"logger":"py.warnings"}
+{"timestamp":"2026-04-19T14:08:39.032655Z","level":"warning","event":"The `airflow.decorators.task` attribute is deprecated. Please use `'airflow.sdk.task'`.","category":"DeprecatedImportWarning","filename":"/Users/guptaaryan/Downloads/IS3107_G4/airflow_standalone/dags/live_data.py","lineno":14,"logger":"py.warnings"}
+{"timestamp":"2026-04-19T14:08:39.039905Z","level":"info","event":"Task instance is in running state","logger":"task.stdout"}
+{"timestamp":"2026-04-19T14:08:39.039978Z","level":"info","event":" Previous state of the Task instance: TaskInstanceState.QUEUED","logger":"task.stdout"}
+{"timestamp":"2026-04-19T14:08:39.040122Z","level":"info","event":"Current task name:fetch_tv_channels","logger":"task.stdout"}
+{"timestamp":"2026-04-19T14:08:39.040166Z","level":"info","event":"Dag name:lichess_live_data","logger":"task.stdout"}
+{"timestamp":"2026-04-19T14:08:39.041265Z","level":"info","event":"Task fetch_tv_channels start","logger":"unusual_prefix_48f441ae5427bc7738623c518dbd3924a0601e0b_live_data","filename":"live_data.py","lineno":440}
+{"timestamp":"2026-04-19T14:08:39.041318Z","level":"info","event":"Fetching Lichess TV channels from https://lichess.org/api/tv/channels","logger":"unusual_prefix_48f441ae5427bc7738623c518dbd3924a0601e0b_live_data","filename":"live_data.py","lineno":232}
