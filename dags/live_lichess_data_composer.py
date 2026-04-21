@@ -278,7 +278,7 @@ def live_data_composer_dag():
                 move_number = processed_moves + 1
                 turn = (move_number + 1) // 2
                 model_input = build_model_input(game, event, move_number=move_number)
-                                prediction = invoke_ml_artifact(model_input)
+                prediction = invoke_ml_artifact(model_input)
                 probs = prediction["probabilities"]
 
                 row = {
