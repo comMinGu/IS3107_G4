@@ -9,6 +9,7 @@ Key hardening changes:
 - Retries transient HTTP failures with backoff.
 - Treats transport/decompression failures as URL-level failures, not per-game parse errors.
 - Cleans up temp files after each monthly file is processed.
+- Fills missing evals with Stockfish Online REST API by default, with optional local Stockfish support.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ import pickle
 import re
 import shutil
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -73,6 +75,15 @@ STOCKFISH_PATH = None
 ENGINE_DEPTH = 1
 ENGINE_TIME_LIMIT = 0.01
 ENGINE_MAX_ROWS = None
+
+STOCKFISH_EVAL_PROVIDER = os.environ.get("STOCKFISH_EVAL_PROVIDER", "online").strip().lower()
+STOCKFISH_ONLINE_API_URL = os.environ.get(
+    "STOCKFISH_ONLINE_API_URL",
+    "https://stockfish.online/api/s/v2.php",
+)
+STOCKFISH_ONLINE_TIMEOUT = float(os.environ.get("STOCKFISH_ONLINE_TIMEOUT", "30"))
+STOCKFISH_ONLINE_MAX_DEPTH = 15
+STOCKFISH_ONLINE_SLEEP_SECONDS = float(os.environ.get("STOCKFISH_ONLINE_SLEEP_SECONDS", "0"))
 
 HTTP_CONNECT_TIMEOUT = 30
 HTTP_READ_TIMEOUT = 300
@@ -358,6 +369,49 @@ def find_stockfish_binary(stockfish_path: Optional[str] = None) -> str:
     )
 
 
+def normalize_eval_provider(provider: Optional[str] = None) -> str:
+    normalized = (provider or STOCKFISH_EVAL_PROVIDER or "online").strip().lower()
+    if normalized not in {"local", "online", "auto"}:
+        raise ValueError(
+            "Invalid STOCKFISH_EVAL_PROVIDER. Supported values: 'local', 'online', 'auto'."
+        )
+    return normalized
+
+
+def parse_optional_float(value: object) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        if pd.isna(value):
+            return None
+        return float(value)
+
+    text = str(value).strip()
+    if not text or text.lower() in {"none", "null", "nan"}:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def parse_optional_int(value: object) -> Optional[int]:
+    parsed_float = parse_optional_float(value)
+    if parsed_float is None:
+        return None
+    return int(parsed_float)
+
+
+def parse_bool_like(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "ok", "success"}
+
+
 def score_fen_with_stockfish(
     engine: chess.engine.SimpleEngine,
     fen: str,
@@ -370,6 +424,7 @@ def score_fen_with_stockfish(
         if time_limit is None
         else chess.engine.Limit(depth=depth, time=time_limit)
     )
+
     info = engine.analyse(board, limit)
     score = info["score"].white()
 
@@ -378,12 +433,56 @@ def score_fen_with_stockfish(
     return score.score(mate_score=100000), None
 
 
+def score_fen_with_stockfish_online(
+    session: requests.Session,
+    fen: str,
+    depth: int = 1,
+    api_url: Optional[str] = None,
+    timeout: Optional[float] = None,
+) -> Tuple[Optional[int], Optional[int]]:
+    resolved_api_url = api_url or STOCKFISH_ONLINE_API_URL
+    if not resolved_api_url:
+        raise ValueError("Stockfish Online API URL is not configured.")
+
+    safe_depth = max(1, min(int(depth), STOCKFISH_ONLINE_MAX_DEPTH))
+    response = session.get(
+        resolved_api_url,
+        params={"fen": fen, "depth": safe_depth},
+        timeout=timeout if timeout is not None else STOCKFISH_ONLINE_TIMEOUT,
+    )
+    response.raise_for_status()
+
+    payload = response.json()
+    success = parse_bool_like(payload.get("success", True))
+    if not success:
+        raise RuntimeError(f"Stockfish Online API returned an error payload: {payload}")
+
+    mate_in = parse_optional_int(payload.get("mate"))
+    evaluation = payload.get("evaluation")
+    eval_float = parse_optional_float(evaluation)
+
+    eval_cp = None
+    if eval_float is not None:
+        eval_cp = int(round(eval_float * 100 if abs(eval_float) < 100 else eval_float))
+
+    if mate_in is not None and mate_in != 0:
+        return None, mate_in
+
+    if eval_cp is None:
+        raise RuntimeError(f"Stockfish Online API returned no usable evaluation payload: {payload}")
+
+    return eval_cp, None
+
+
 def fill_missing_evals_with_stockfish(
     df: pd.DataFrame,
     stockfish_path: Optional[str] = None,
     depth: int = 1,
     time_limit: Optional[float] = 0.01,
     max_rows: Optional[int] = None,
+    provider: Optional[str] = None,
+    api_url: Optional[str] = None,
+    api_timeout: Optional[float] = None,
 ) -> pd.DataFrame:
     missing_mask = df["eval_cp"].isna() & df["mate_in"].isna()
     missing_idx = list(df.index[missing_mask])
@@ -395,14 +494,57 @@ def fill_missing_evals_with_stockfish(
         print("No missing evals to fill.")
         return df
 
-    engine_path = find_stockfish_binary(stockfish_path)
-    print(f"Using Stockfish at: {engine_path}")
-    print(f"Rows queued for engine eval: {len(missing_idx)}")
-
     filled_df = df.copy()
     fen_cache: Dict[str, Tuple[Optional[int], Optional[int]]] = {}
+    resolved_provider = normalize_eval_provider(provider)
 
-    with chess.engine.SimpleEngine.popen_uci(engine_path) as engine:
+    local_engine_path: Optional[str] = None
+    if resolved_provider in {"local", "auto"}:
+        try:
+            local_engine_path = find_stockfish_binary(stockfish_path)
+        except FileNotFoundError:
+            if resolved_provider == "local":
+                raise
+
+    use_online = resolved_provider == "online" or local_engine_path is None
+
+    print(f"Eval provider strategy: {resolved_provider}")
+    print(f"Rows queued for engine eval: {len(missing_idx)}")
+
+    if use_online:
+        resolved_api_url = api_url or STOCKFISH_ONLINE_API_URL
+        if not resolved_api_url:
+            raise FileNotFoundError(
+                "No local Stockfish binary found and STOCKFISH_ONLINE_API_URL is not configured."
+            )
+
+        if resolved_provider == "auto" and local_engine_path is None:
+            print("Local Stockfish binary not found; falling back to Stockfish Online API.")
+        else:
+            print(f"Using Stockfish Online API: {resolved_api_url}")
+
+        with build_retrying_session() as session:
+            for idx in tqdm(missing_idx, desc="Computing missing evals", unit="row"):
+                fen = filled_df.at[idx, "fen_after"]
+                if fen not in fen_cache:
+                    fen_cache[fen] = score_fen_with_stockfish_online(
+                        session=session,
+                        fen=fen,
+                        depth=depth,
+                        api_url=resolved_api_url,
+                        timeout=api_timeout,
+                    )
+                    if STOCKFISH_ONLINE_SLEEP_SECONDS > 0:
+                        time.sleep(STOCKFISH_ONLINE_SLEEP_SECONDS)
+
+                eval_cp, mate_in = fen_cache[fen]
+                filled_df.at[idx, "eval_cp"] = eval_cp
+                filled_df.at[idx, "mate_in"] = mate_in
+
+        return filled_df
+
+    print(f"Using Stockfish at: {local_engine_path}")
+    with chess.engine.SimpleEngine.popen_uci(local_engine_path) as engine:
         for idx in tqdm(missing_idx, desc="Computing missing evals", unit="row"):
             fen = filled_df.at[idx, "fen_after"]
             if fen not in fen_cache:
@@ -412,6 +554,7 @@ def fill_missing_evals_with_stockfish(
                     depth=depth,
                     time_limit=time_limit,
                 )
+
             eval_cp, mate_in = fen_cache[fen]
             filled_df.at[idx, "eval_cp"] = eval_cp
             filled_df.at[idx, "mate_in"] = mate_in
@@ -565,7 +708,6 @@ def load_filtered_broadcast_games(
                                         "clock_seconds_after_move": clk_seconds,
                                     }
                                 )
-
                                 node = next_node
 
                             matched_games += 1
@@ -577,7 +719,6 @@ def load_filtered_broadcast_games(
                 finally:
                     if local_stream is not None:
                         local_stream.close()
-
     finally:
         session.close()
 
@@ -618,6 +759,9 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
             depth=ENGINE_DEPTH,
             time_limit=ENGINE_TIME_LIMIT,
             max_rows=ENGINE_MAX_ROWS,
+            provider=STOCKFISH_EVAL_PROVIDER,
+            api_url=STOCKFISH_ONLINE_API_URL,
+            api_timeout=STOCKFISH_ONLINE_TIMEOUT,
         )
     else:
         print("Skipping Stockfish fill.")
@@ -643,11 +787,14 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
 
     eval_series = model_df["eval_cp"].dropna()
     print("=== eval_cp stats after fill ===")
-    print("min:", eval_series.min())
-    print("max:", eval_series.max())
-    print("positive:", (eval_series > 0).sum())
-    print("negative:", (eval_series < 0).sum())
-    print("zero:", (eval_series == 0).sum())
+    if eval_series.empty:
+        print("No eval_cp values available after fill.")
+    else:
+        print("min:", eval_series.min())
+        print("max:", eval_series.max())
+        print("positive:", (eval_series > 0).sum())
+        print("negative:", (eval_series < 0).sum())
+        print("zero:", (eval_series == 0).sum())
 
     model_df["elo_diff"] = model_df["white_elo"] - model_df["black_elo"]
     model_df["time_left_seconds"] = model_df["clock_seconds_after_move"].clip(lower=0)
@@ -688,6 +835,7 @@ def split_games(model_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.
         random_state=42,
         stratify=game_level_df["game_label"],
     )
+
     val_size_within_train_val = 0.15 / 0.85
     train_games, val_games = train_test_split(
         train_val_games,
@@ -758,15 +906,25 @@ def train_model(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFr
     metrics = {
         "validation_log_loss": float(log_loss(y_val, val_proba, labels=[0, 1, 2])),
         "validation_accuracy": float(accuracy_score(y_val, val_pred)),
-        "validation_macro_precision": float(precision_score(y_val, val_pred, average="macro", zero_division=0)),
-        "validation_macro_recall": float(recall_score(y_val, val_pred, average="macro", zero_division=0)),
+        "validation_macro_precision": float(
+            precision_score(y_val, val_pred, average="macro", zero_division=0)
+        ),
+        "validation_macro_recall": float(
+            recall_score(y_val, val_pred, average="macro", zero_division=0)
+        ),
         "validation_macro_f1": float(f1_score(y_val, val_pred, average="macro", zero_division=0)),
         "test_log_loss": float(log_loss(y_test, test_proba, labels=[0, 1, 2])),
         "test_accuracy": float(accuracy_score(y_test, test_pred)),
-        "test_macro_precision": float(precision_score(y_test, test_pred, average="macro", zero_division=0)),
-        "test_macro_recall": float(recall_score(y_test, test_pred, average="macro", zero_division=0)),
+        "test_macro_precision": float(
+            precision_score(y_test, test_pred, average="macro", zero_division=0)
+        ),
+        "test_macro_recall": float(
+            recall_score(y_test, test_pred, average="macro", zero_division=0)
+        ),
         "test_macro_f1": float(f1_score(y_test, test_pred, average="macro", zero_division=0)),
-        "test_weighted_f1": float(f1_score(y_test, test_pred, average="weighted", zero_division=0)),
+        "test_weighted_f1": float(
+            f1_score(y_test, test_pred, average="weighted", zero_division=0)
+        ),
     }
 
     print("Validation log loss:", metrics["validation_log_loss"])
@@ -793,6 +951,7 @@ def train_model(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFr
             classification_report_rows.append(
                 {**classification_report_dict[summary_label], "label": summary_label}
             )
+
     classification_report_df = pd.DataFrame(classification_report_rows).set_index("label")
     classification_report_df.index.name = "label"
 
@@ -921,11 +1080,17 @@ def save_pdf_report(
         fig.colorbar(heatmap, ax=axes[0], fraction=0.046, pad=0.04)
 
         feature_importance_df = artifacts.feature_importance_df.sort_values("importance", ascending=True)
-        axes[1].barh(feature_importance_df["feature"], feature_importance_df["importance"], color="#4C78A8")
+        axes[1].barh(
+            feature_importance_df["feature"],
+            feature_importance_df["importance"],
+            color="#4C78A8",
+        )
         axes[1].set_title("Feature Importance")
         axes[1].set_xlabel("Importance")
 
-        class_distribution = artifacts.test_game_class_distribution.reindex(artifacts.label_order, fill_value=0)
+        class_distribution = artifacts.test_game_class_distribution.reindex(
+            artifacts.label_order, fill_value=0
+        )
         axes[2].bar(class_distribution.index, class_distribution.values, color="#72B7B2")
         axes[2].set_title("Test Game Class Distribution")
         axes[2].set_ylabel("Games")
@@ -988,6 +1153,8 @@ def main(run_date: Optional[str] = None, artifact_path: str = "artifacts/chess_w
     print("Broadcast URLs:")
     for url in broadcast_urls:
         print("-", url)
+    print("Eval provider:", normalize_eval_provider(STOCKFISH_EVAL_PROVIDER))
+    print("Stockfish Online API URL:", STOCKFISH_ONLINE_API_URL)
 
     df = load_filtered_broadcast_games(
         urls=broadcast_urls,
@@ -998,6 +1165,7 @@ def main(run_date: Optional[str] = None, artifact_path: str = "artifacts/chess_w
     model_df = engineer_features(df)
     train_df, val_df, test_df = split_games(model_df)
     training_artifacts = train_model(train_df, val_df, test_df)
+
     save_pdf_report(
         training_artifacts,
         artifact_path=artifact_path,
