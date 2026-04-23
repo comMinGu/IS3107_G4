@@ -3,6 +3,12 @@
 This script is the operational counterpart to `ml_model.ipynb`.
 It keeps the notebook's current baseline approach, but packages the core
 steps into a Python entry point that can later be called by Airflow.
+
+Key hardening changes:
+- Downloads each .pgn.zst file to local disk before parsing.
+- Retries transient HTTP failures with backoff.
+- Treats transport/decompression failures as URL-level failures, not per-game parse errors.
+- Cleans up temp files after each monthly file is processed.
 """
 
 from __future__ import annotations
@@ -13,10 +19,11 @@ import os
 import pickle
 import re
 import shutil
+import tempfile
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import chess
 import chess.engine
@@ -25,6 +32,7 @@ import numpy as np
 import pandas as pd
 import requests
 import zstandard as zstd
+from requests.adapters import HTTPAdapter
 from sklearn.metrics import (
     accuracy_score,
     classification_report,
@@ -36,6 +44,7 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
+from urllib3.util.retry import Retry
 
 try:
     import lightgbm as lgb
@@ -51,7 +60,6 @@ try:
 except ImportError as exc:
     raise ImportError("Matplotlib is required for PDF report generation. Run `pip install matplotlib`.") from exc
 
-
 TARGET_FILTERED_GAMES = 2000
 MIN_BLACK_WIN_GAMES = 200
 MAX_WHITE_WIN_GAMES = 900
@@ -66,6 +74,13 @@ ENGINE_DEPTH = 1
 ENGINE_TIME_LIMIT = 0.01
 ENGINE_MAX_ROWS = None
 
+HTTP_CONNECT_TIMEOUT = 30
+HTTP_READ_TIMEOUT = 300
+HTTP_CHUNK_SIZE = 1024 * 1024
+HTTP_TOTAL_RETRIES = 5
+HTTP_BACKOFF_FACTOR = 2
+TEMP_DOWNLOAD_DIR = None
+
 FEATURE_COLS = [
     "eval_cp_clipped",
     "elo_diff",
@@ -73,6 +88,7 @@ FEATURE_COLS = [
     "ply",
     "side_to_move",
 ]
+
 LABEL_ORDER = ["white_win", "draw", "black_win"]
 
 DEFAULT_STOCKFISH_CANDIDATES = [
@@ -81,6 +97,7 @@ DEFAULT_STOCKFISH_CANDIDATES = [
     shutil.which("stockfish"),
     "/opt/homebrew/bin/stockfish",
     "/usr/local/bin/stockfish",
+    "/usr/bin/stockfish",
 ]
 
 
@@ -96,6 +113,25 @@ class TrainingArtifacts:
     confusion_matrix_df: pd.DataFrame
     feature_importance_df: pd.DataFrame
     test_game_class_distribution: pd.Series
+
+
+@dataclass
+class LocalZstStream:
+    text_stream: io.TextIOBase
+    reader: object
+    file_handle: object
+    path: Path
+
+    def close(self) -> None:
+        for obj in (self.text_stream, self.reader, self.file_handle):
+            try:
+                obj.close()
+            except Exception:
+                pass
+        try:
+            self.path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def parse_args() -> argparse.Namespace:
@@ -119,7 +155,7 @@ def parse_run_date(run_date_str: Optional[str]) -> date:
     return datetime.strptime(run_date_str, "%Y-%m-%d").date()
 
 
-def shift_month(year: int, month: int, offset: int) -> tuple[int, int]:
+def shift_month(year: int, month: int, offset: int) -> Tuple[int, int]:
     total_months = year * 12 + (month - 1) + offset
     shifted_year = total_months // 12
     shifted_month = total_months % 12 + 1
@@ -135,7 +171,7 @@ def build_broadcast_urls(
         run_date = date.today()
 
     start_offset = -1 if run_date.day >= cutoff_day else -2
-    urls = []
+    urls: List[str] = []
 
     for i in range(months_to_load):
         year, month = shift_month(run_date.year, run_date.month, start_offset - i)
@@ -144,13 +180,69 @@ def build_broadcast_urls(
     return urls
 
 
-def stream_text_from_zst_url(url: str) -> io.TextIOBase:
-    response = requests.get(url, stream=True, timeout=120)
-    response.raise_for_status()
+def build_retrying_session() -> requests.Session:
+    session = requests.Session()
+    retry = Retry(
+        total=HTTP_TOTAL_RETRIES,
+        connect=HTTP_TOTAL_RETRIES,
+        read=HTTP_TOTAL_RETRIES,
+        status=HTTP_TOTAL_RETRIES,
+        backoff_factor=HTTP_BACKOFF_FACTOR,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
 
+
+def download_zst_to_temp(url: str, session: Optional[requests.Session] = None) -> Path:
+    own_session = session is None
+    session = session or build_retrying_session()
+
+    temp_dir = TEMP_DOWNLOAD_DIR if TEMP_DOWNLOAD_DIR else None
+    with tempfile.NamedTemporaryFile(
+        mode="wb",
+        suffix=".pgn.zst",
+        prefix="lichess_broadcast_",
+        delete=False,
+        dir=temp_dir,
+    ) as tmp_file:
+        temp_path = Path(tmp_file.name)
+
+    try:
+        with session.get(
+            url,
+            stream=True,
+            timeout=(HTTP_CONNECT_TIMEOUT, HTTP_READ_TIMEOUT),
+        ) as response:
+            response.raise_for_status()
+            with temp_path.open("wb") as file_obj:
+                for chunk in response.iter_content(chunk_size=HTTP_CHUNK_SIZE):
+                    if chunk:
+                        file_obj.write(chunk)
+        return temp_path
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+    finally:
+        if own_session:
+            session.close()
+
+
+def open_local_zst_as_text(path: Path) -> LocalZstStream:
+    file_handle = path.open("rb")
     dctx = zstd.ZstdDecompressor()
-    reader = dctx.stream_reader(response.raw)
-    return io.TextIOWrapper(reader, encoding="utf-8", errors="replace")
+    reader = dctx.stream_reader(file_handle)
+    text_stream = io.TextIOWrapper(reader, encoding="utf-8", errors="replace")
+    return LocalZstStream(
+        text_stream=text_stream,
+        reader=reader,
+        file_handle=file_handle,
+        path=path,
+    )
 
 
 def parse_clock_to_seconds(clock_str: str) -> Optional[float]:
@@ -201,7 +293,9 @@ def game_matches_filters(
     black_elo_raw = headers.get("BlackElo")
     white_elo = int(white_elo_raw) if white_elo_raw and white_elo_raw.isdigit() else None
     black_elo = int(black_elo_raw) if black_elo_raw and black_elo_raw.isdigit() else None
-    has_super_gm = (white_elo is not None and white_elo >= min_elo) or (black_elo is not None and black_elo >= min_elo)
+    has_super_gm = (white_elo is not None and white_elo >= min_elo) or (
+        black_elo is not None and black_elo >= min_elo
+    )
 
     game_date = parse_lichess_date(headers.get("Date"))
     if game_date is None:
@@ -216,7 +310,7 @@ def game_matches_filters(
     return has_super_gm and is_recent_enough and is_long_time_control
 
 
-def extract_eval_and_clock(comment: str) -> tuple[Optional[int], Optional[int], Optional[float]]:
+def extract_eval_and_clock(comment: str) -> Tuple[Optional[int], Optional[int], Optional[float]]:
     eval_cp = None
     mate_in = None
     clk_seconds = None
@@ -269,9 +363,13 @@ def score_fen_with_stockfish(
     fen: str,
     depth: int = 1,
     time_limit: Optional[float] = 0.01,
-) -> tuple[Optional[int], Optional[int]]:
+) -> Tuple[Optional[int], Optional[int]]:
     board = chess.Board(fen)
-    limit = chess.engine.Limit(depth=depth) if time_limit is None else chess.engine.Limit(depth=depth, time=time_limit)
+    limit = (
+        chess.engine.Limit(depth=depth)
+        if time_limit is None
+        else chess.engine.Limit(depth=depth, time=time_limit)
+    )
     info = engine.analyse(board, limit)
     score = info["score"].white()
 
@@ -302,7 +400,7 @@ def fill_missing_evals_with_stockfish(
     print(f"Rows queued for engine eval: {len(missing_idx)}")
 
     filled_df = df.copy()
-    fen_cache: Dict[str, tuple[Optional[int], Optional[int]]] = {}
+    fen_cache: Dict[str, Tuple[Optional[int], Optional[int]]] = {}
 
     with chess.engine.SimpleEngine.popen_uci(engine_path) as engine:
         for idx in tqdm(missing_idx, desc="Computing missing evals", unit="row"):
@@ -337,141 +435,151 @@ def load_filtered_broadcast_games(
     earliest_date = today - pd.Timedelta(days=max_game_age_days)
     matched_games = 0
     accepted_game_counts = {"white_win": 0, "draw": 0, "black_win": 0}
+    session = build_retrying_session()
 
-    with tqdm(total=target_games, desc="Parsing filtered games", unit="game") as progress:
-        for url in urls:
-            if matched_games >= target_games and (
-                min_black_win_games is None
-                or accepted_game_counts["black_win"] >= min_black_win_games
-            ):
-                break
-
-            print(f"Reading from: {url}")
-            text_stream = stream_text_from_zst_url(url)
-
-            while True:
+    try:
+        with tqdm(total=target_games, desc="Parsing filtered games", unit="game") as progress:
+            for url in urls:
                 if matched_games >= target_games and (
                     min_black_win_games is None
                     or accepted_game_counts["black_win"] >= min_black_win_games
                 ):
                     break
 
+                local_stream: Optional[LocalZstStream] = None
                 try:
-                    game = chess.pgn.read_game(text_stream)
-                    if game is None:
-                        break
-
-                    headers = game.headers
-                    # Basic game filter: if these fail, skip the game entirely.
-                    if not game_matches_filters(
-                        headers,
-                        min_elo=min_elo,
-                        min_time_control_seconds=min_time_control_seconds,
-                        earliest_date=earliest_date,
-                        latest_date=today,
-                    ):
-                        continue
-                except Exception as e:
-                    print(f"Error parsing game header at {url}; skipping game: {e}")
+                    print(f"Downloading: {url}")
+                    local_path = download_zst_to_temp(url, session=session)
+                    print(f"Downloaded to temporary file: {local_path.as_posix()}")
+                    local_stream = open_local_zst_as_text(local_path)
+                    text_stream = local_stream.text_stream
+                except Exception as exc:
+                    print(f"Download/open failed for {url}; skipping URL: {exc}")
                     continue
 
-                # From here on, wrap the inner move‑walk in another try block
-                # so that one broken move does not kill the whole game.
                 try:
-                    result = headers.get("Result", "")
-                    game_label = result_to_label(result)
+                    while True:
+                        if matched_games >= target_games and (
+                            min_black_win_games is None
+                            or accepted_game_counts["black_win"] >= min_black_win_games
+                        ):
+                            break
 
-                    if game_label == "unknown":
-                        continue
-
-                    if (
-                        game_label == "white_win"
-                        and max_white_win_games is not None
-                        and accepted_game_counts["white_win"] >= max_white_win_games
-                    ):
-                        continue
-                    if (
-                        game_label == "draw"
-                        and max_draw_games is not None
-                        and accepted_game_counts["draw"] >= max_draw_games
-                    ):
-                        continue
-
-                    white_elo = headers.get("WhiteElo")
-                    black_elo = headers.get("BlackElo")
-                    site = headers.get("Site", "")
-                    game_id = site.rstrip("/").split("/")[-1] if site else None
-
-                    board = game.board()
-                    node = game
-                    ply = 0
-
-                    while node.variations:
-                        next_node = node.variation(0)
-                        move = next_node.move
-                        ply += 1
-
-                        fen_before = board.fen()
-                        side_to_move = "white" if board.turn == chess.WHITE else "black"
-                        san = board.san(move)
-                        uci = move.uci()
-
-                        board.push(move)
-                        fen_after = board.fen()
-
-                        comment = next_node.comment or ""
                         try:
-                            eval_cp, mate_in, clk_seconds = extract_eval_and_clock(comment)
-                        except Exception as e:
-                            print(
-                                f"Error parsing eval/clock at ply {ply} in game {game_id}; skipping move: {e}"
-                            )
-                            # Skip just this move, keep going with the rest of the game.
-                            node = next_node
+                            game = chess.pgn.read_game(text_stream)
+                        except Exception as exc:
+                            print(f"Fatal read/decompression error for {url}; abandoning URL: {exc}")
+                            break
+
+                        if game is None:
+                            break
+
+                        try:
+                            headers = game.headers
+                            if not game_matches_filters(
+                                headers,
+                                min_elo=min_elo,
+                                min_time_control_seconds=min_time_control_seconds,
+                                earliest_date=earliest_date,
+                                latest_date=today,
+                            ):
+                                continue
+                        except Exception as exc:
+                            print(f"Error parsing game headers inside {url}; skipping game: {exc}")
                             continue
 
-                        rows.append(
-                            {
-                                "game_id": game_id,
-                                "date": headers.get("Date"),
-                                "white_player": headers.get("White"),
-                                "black_player": headers.get("Black"),
-                                "white_elo": (
-                                    int(white_elo)
-                                    if white_elo and white_elo.isdigit()
-                                    else None
-                                ),
-                                "black_elo": (
-                                    int(black_elo)
-                                    if black_elo and black_elo.isdigit()
-                                    else None
-                                ),
-                                "result": result,
-                                "label": game_label,
-                                "time_control": headers.get("TimeControl"),
-                                "eco": headers.get("ECO"),
-                                "opening": headers.get("Opening"),
-                                "ply": ply,
-                                "side_to_move": side_to_move,
-                                "san": san,
-                                "uci": uci,
-                                "fen_before": fen_before,
-                                "fen_after": fen_after,
-                                "eval_cp": eval_cp,
-                                "mate_in": mate_in,
-                                "clock_seconds_after_move": clk_seconds,
-                            }
-                        )
+                        game_id = None
+                        try:
+                            result = headers.get("Result", "")
+                            game_label = result_to_label(result)
 
-                        node = next_node
+                            if game_label == "unknown":
+                                continue
 
-                    matched_games += 1
-                    accepted_game_counts[game_label] += 1
-                    progress.update(1)
+                            if (
+                                game_label == "white_win"
+                                and max_white_win_games is not None
+                                and accepted_game_counts["white_win"] >= max_white_win_games
+                            ):
+                                continue
+                            if (
+                                game_label == "draw"
+                                and max_draw_games is not None
+                                and accepted_game_counts["draw"] >= max_draw_games
+                            ):
+                                continue
 
-                except Exception as e:
-                    print(f"Error processing game {game_id} at {url}; skipping entire game: {e}")
-                    continue
+                            white_elo = headers.get("WhiteElo")
+                            black_elo = headers.get("BlackElo")
+                            site = headers.get("Site", "")
+                            game_id = site.rstrip("/").split("/")[-1] if site else None
+
+                            board = game.board()
+                            node = game
+                            ply = 0
+
+                            while node.variations:
+                                next_node = node.variation(0)
+                                move = next_node.move
+                                ply += 1
+
+                                fen_before = board.fen()
+                                side_to_move = "white" if board.turn == chess.WHITE else "black"
+                                san = board.san(move)
+                                uci = move.uci()
+
+                                board.push(move)
+                                fen_after = board.fen()
+
+                                comment = next_node.comment or ""
+                                try:
+                                    eval_cp, mate_in, clk_seconds = extract_eval_and_clock(comment)
+                                except Exception as exc:
+                                    print(
+                                        f"Error parsing eval/clock at ply {ply} in game {game_id}; skipping move: {exc}"
+                                    )
+                                    node = next_node
+                                    continue
+
+                                rows.append(
+                                    {
+                                        "game_id": game_id,
+                                        "date": headers.get("Date"),
+                                        "white_player": headers.get("White"),
+                                        "black_player": headers.get("Black"),
+                                        "white_elo": int(white_elo) if white_elo and white_elo.isdigit() else None,
+                                        "black_elo": int(black_elo) if black_elo and black_elo.isdigit() else None,
+                                        "result": result,
+                                        "label": game_label,
+                                        "time_control": headers.get("TimeControl"),
+                                        "eco": headers.get("ECO"),
+                                        "opening": headers.get("Opening"),
+                                        "ply": ply,
+                                        "side_to_move": side_to_move,
+                                        "san": san,
+                                        "uci": uci,
+                                        "fen_before": fen_before,
+                                        "fen_after": fen_after,
+                                        "eval_cp": eval_cp,
+                                        "mate_in": mate_in,
+                                        "clock_seconds_after_move": clk_seconds,
+                                    }
+                                )
+
+                                node = next_node
+
+                            matched_games += 1
+                            accepted_game_counts[game_label] += 1
+                            progress.update(1)
+                        except Exception as exc:
+                            print(f"Error processing game {game_id} at {url}; skipping entire game: {exc}")
+                            continue
+                finally:
+                    if local_stream is not None:
+                        local_stream.close()
+
+    finally:
+        session.close()
 
     return pd.DataFrame(rows)
 
@@ -558,7 +666,6 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
         "ply",
         "side_to_move",
     ]
-
     model_df = model_df.dropna(subset=required_columns).copy()
     label_to_id = {label: idx for idx, label in enumerate(LABEL_ORDER)}
     model_df = model_df[model_df["label"].isin(label_to_id)].copy()
@@ -572,7 +679,7 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     return model_df
 
 
-def split_games(model_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def split_games(model_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     game_level_df = model_df.groupby("game_id", as_index=False).agg(game_label=("label", "first"))
 
     train_val_games, test_games = train_test_split(
@@ -581,7 +688,6 @@ def split_games(model_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.
         random_state=42,
         stratify=game_level_df["game_label"],
     )
-
     val_size_within_train_val = 0.15 / 0.85
     train_games, val_games = train_test_split(
         train_val_games,
@@ -668,7 +774,7 @@ def train_model(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFr
     print("Test log loss:", metrics["test_log_loss"])
     print("Test accuracy:", metrics["test_accuracy"])
     print("\nTest classification report:")
-    print(classification_report(y_test, test_pred, target_names=LABEL_ORDER))
+    print(classification_report(y_test, test_pred, target_names=LABEL_ORDER, zero_division=0))
 
     classification_report_dict = classification_report(
         y_test,
@@ -732,8 +838,6 @@ def save_pdf_report(
     broadcast_urls: List[str],
 ) -> None:
     report_path = build_report_path(artifact_path, run_date)
-    # Save the human-readable report next to the local artifact output under
-    # `artifacts/reports/`, creating the folder automatically for each teammate.
     report_path.parent.mkdir(parents=True, exist_ok=True)
 
     summary_metrics_df = pd.DataFrame(
@@ -841,9 +945,6 @@ def save_model_bundle(
     broadcast_urls: List[str],
 ) -> None:
     artifact_file = Path(artifact_path)
-    # Create `artifacts/` automatically inside the local project checkout so
-    # teammates can run the pipeline from different repo locations without
-    # changing any machine-specific paths.
     artifact_file.parent.mkdir(parents=True, exist_ok=True)
 
     model_bundle = {
