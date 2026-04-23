@@ -341,7 +341,8 @@ def load_filtered_broadcast_games(
     with tqdm(total=target_games, desc="Parsing filtered games", unit="game") as progress:
         for url in urls:
             if matched_games >= target_games and (
-                min_black_win_games is None or accepted_game_counts["black_win"] >= min_black_win_games
+                min_black_win_games is None
+                or accepted_game_counts["black_win"] >= min_black_win_games
             ):
                 break
 
@@ -350,90 +351,127 @@ def load_filtered_broadcast_games(
 
             while True:
                 if matched_games >= target_games and (
-                    min_black_win_games is None or accepted_game_counts["black_win"] >= min_black_win_games
+                    min_black_win_games is None
+                    or accepted_game_counts["black_win"] >= min_black_win_games
                 ):
                     break
 
-                game = chess.pgn.read_game(text_stream)
-                if game is None:
-                    break
+                try:
+                    game = chess.pgn.read_game(text_stream)
+                    if game is None:
+                        break
 
-                headers = game.headers
-                if not game_matches_filters(
-                    headers,
-                    min_elo=min_elo,
-                    min_time_control_seconds=min_time_control_seconds,
-                    earliest_date=earliest_date,
-                    latest_date=today,
-                ):
+                    headers = game.headers
+                    # Basic game filter: if these fail, skip the game entirely.
+                    if not game_matches_filters(
+                        headers,
+                        min_elo=min_elo,
+                        min_time_control_seconds=min_time_control_seconds,
+                        earliest_date=earliest_date,
+                        latest_date=today,
+                    ):
+                        continue
+                except Exception as e:
+                    print(f"Error parsing game header at {url}; skipping game: {e}")
                     continue
 
-                board = game.board()
-                result = headers.get("Result", "")
-                game_label = result_to_label(result)
+                # From here on, wrap the inner move‑walk in another try block
+                # so that one broken move does not kill the whole game.
+                try:
+                    result = headers.get("Result", "")
+                    game_label = result_to_label(result)
 
-                if game_label == "unknown":
+                    if game_label == "unknown":
+                        continue
+
+                    if (
+                        game_label == "white_win"
+                        and max_white_win_games is not None
+                        and accepted_game_counts["white_win"] >= max_white_win_games
+                    ):
+                        continue
+                    if (
+                        game_label == "draw"
+                        and max_draw_games is not None
+                        and accepted_game_counts["draw"] >= max_draw_games
+                    ):
+                        continue
+
+                    white_elo = headers.get("WhiteElo")
+                    black_elo = headers.get("BlackElo")
+                    site = headers.get("Site", "")
+                    game_id = site.rstrip("/").split("/")[-1] if site else None
+
+                    board = game.board()
+                    node = game
+                    ply = 0
+
+                    while node.variations:
+                        next_node = node.variation(0)
+                        move = next_node.move
+                        ply += 1
+
+                        fen_before = board.fen()
+                        side_to_move = "white" if board.turn == chess.WHITE else "black"
+                        san = board.san(move)
+                        uci = move.uci()
+
+                        board.push(move)
+                        fen_after = board.fen()
+
+                        comment = next_node.comment or ""
+                        try:
+                            eval_cp, mate_in, clk_seconds = extract_eval_and_clock(comment)
+                        except Exception as e:
+                            print(
+                                f"Error parsing eval/clock at ply {ply} in game {game_id}; skipping move: {e}"
+                            )
+                            # Skip just this move, keep going with the rest of the game.
+                            node = next_node
+                            continue
+
+                        rows.append(
+                            {
+                                "game_id": game_id,
+                                "date": headers.get("Date"),
+                                "white_player": headers.get("White"),
+                                "black_player": headers.get("Black"),
+                                "white_elo": (
+                                    int(white_elo)
+                                    if white_elo and white_elo.isdigit()
+                                    else None
+                                ),
+                                "black_elo": (
+                                    int(black_elo)
+                                    if black_elo and black_elo.isdigit()
+                                    else None
+                                ),
+                                "result": result,
+                                "label": game_label,
+                                "time_control": headers.get("TimeControl"),
+                                "eco": headers.get("ECO"),
+                                "opening": headers.get("Opening"),
+                                "ply": ply,
+                                "side_to_move": side_to_move,
+                                "san": san,
+                                "uci": uci,
+                                "fen_before": fen_before,
+                                "fen_after": fen_after,
+                                "eval_cp": eval_cp,
+                                "mate_in": mate_in,
+                                "clock_seconds_after_move": clk_seconds,
+                            }
+                        )
+
+                        node = next_node
+
+                    matched_games += 1
+                    accepted_game_counts[game_label] += 1
+                    progress.update(1)
+
+                except Exception as e:
+                    print(f"Error processing game {game_id} at {url}; skipping entire game: {e}")
                     continue
-
-                if game_label == "white_win" and max_white_win_games is not None and accepted_game_counts["white_win"] >= max_white_win_games:
-                    continue
-                if game_label == "draw" and max_draw_games is not None and accepted_game_counts["draw"] >= max_draw_games:
-                    continue
-
-                white_elo = headers.get("WhiteElo")
-                black_elo = headers.get("BlackElo")
-                site = headers.get("Site", "")
-                game_id = site.rstrip("/").split("/")[-1] if site else None
-
-                node = game
-                ply = 0
-
-                while node.variations:
-                    next_node = node.variation(0)
-                    move = next_node.move
-                    ply += 1
-
-                    fen_before = board.fen()
-                    side_to_move = "white" if board.turn == chess.WHITE else "black"
-                    san = board.san(move)
-                    uci = move.uci()
-
-                    board.push(move)
-                    fen_after = board.fen()
-
-                    comment = next_node.comment or ""
-                    eval_cp, mate_in, clk_seconds = extract_eval_and_clock(comment)
-
-                    rows.append(
-                        {
-                            "game_id": game_id,
-                            "date": headers.get("Date"),
-                            "white_player": headers.get("White"),
-                            "black_player": headers.get("Black"),
-                            "white_elo": int(white_elo) if white_elo and white_elo.isdigit() else None,
-                            "black_elo": int(black_elo) if black_elo and black_elo.isdigit() else None,
-                            "result": result,
-                            "label": game_label,
-                            "time_control": headers.get("TimeControl"),
-                            "eco": headers.get("ECO"),
-                            "opening": headers.get("Opening"),
-                            "ply": ply,
-                            "side_to_move": side_to_move,
-                            "san": san,
-                            "uci": uci,
-                            "fen_before": fen_before,
-                            "fen_after": fen_after,
-                            "eval_cp": eval_cp,
-                            "mate_in": mate_in,
-                            "clock_seconds_after_move": clk_seconds,
-                        }
-                    )
-
-                    node = next_node
-
-                matched_games += 1
-                accepted_game_counts[game_label] += 1
-                progress.update(1)
 
     return pd.DataFrame(rows)
 

@@ -169,16 +169,32 @@ def build_model_input(game: dict[str, Any], move: dict[str, Any], move_number: i
     }
 
 
+DEFAULT_PROBS_FALLBACK = {
+    "white_win": 0.17,
+    "draw": 0.7,
+    "black_win": 0.13,
+}
+
+
 def invoke_ml_artifact(model_input: dict[str, Any]) -> dict[str, Any]:
-    bundle = load_model_bundle()
-    feature_cols: list[str] = bundle["feature_cols"]
-    label_order: list[str] = bundle["label_order"]
-    frame = pd.DataFrame([model_input], columns=feature_cols)
-    probabilities = bundle["model"].predict_proba(frame)[0]
-    return {
-        "predicted_label": label_order[int(probabilities.argmax())],
-        "probabilities": {label_order[idx]: float(probabilities[idx]) for idx in range(len(label_order))},
-    }
+    try:
+        bundle = load_model_bundle()
+        feature_cols: list[str] = bundle["feature_cols"]
+        label_order: list[str] = bundle["label_order"]
+        frame = pd.DataFrame([model_input], columns=feature_cols)
+        probabilities = bundle["model"].predict_proba(frame)[0]
+        predicted_label = label_order[int(probabilities.argmax())]
+        prob_dict = {label_order[idx]: float(probabilities[idx]) for idx in range(len(label_order))}
+        return {
+            "predicted_label": predicted_label,
+            "probabilities": prob_dict,
+        }
+    except Exception as e:
+        log.warning("Failed to run ML model, falling back to default probabilities: %s", e)
+        return {
+            "predicted_label": "draw",
+            "probabilities": DEFAULT_PROBS_FALLBACK,
+        }
 
 def upsert_prediction_result(result: dict[str, Any]) -> None:
     hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
