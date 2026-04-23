@@ -1,0 +1,537 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lichess TV Classical Dashboard</title>
+  <link href="https://api.fontshare.com/v2/css?f[]=satoshi@400,500,700&display=swap" rel="stylesheet">
+  <style>
+    :root, [data-theme="light"] {
+      --bg:#f7f6f2; --surface:#f9f8f5; --surface2:#fbfbf9; --surface3:#f3f0ec; --border:#d4d1ca;
+      --text:#28251d; --muted:#6f6d67; --faint:#aaa7a0; --inverse:#f9f8f4; --primary:#01696f; --primary2:#0c4e54;
+      --warning:#964219; --error:#a12c7b; --shadow:0 1px 2px rgb(0 0 0 / .06); --shadow2:0 12px 40px rgb(0 0 0 / .12);
+      --font:'Satoshi',Inter,sans-serif;
+    }
+    [data-theme="dark"] {
+      --bg:#121110; --surface:#181715; --surface2:#1d1c1a; --surface3:#23221f; --border:#363532;
+      --text:#e6e2da; --muted:#a6a198; --faint:#6f6a63; --inverse:#141311; --primary:#4f98a3; --primary2:#6aaeb8;
+      --warning:#cf854d; --error:#d163a7; --shadow:0 1px 2px rgb(0 0 0 / .2); --shadow2:0 12px 40px rgb(0 0 0 / .32);
+    }
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{
+      min-height:100vh;
+      background:radial-gradient(circle at top,rgb(79 152 163 / .12),transparent 28%),var(--bg);
+      color:var(--text);
+      font:16px/1.55 var(--font);
+      padding:24px
+    }
+    .app{max-width:1380px;margin:0 auto;display:grid;gap:24px}
+    .topbar,.panel,.stat,.footer{
+      background:var(--surface);
+      border:1px solid rgb(from var(--border) r g b / .72);
+      box-shadow:var(--shadow)
+    }
+    .topbar{
+      border-radius:16px;
+      padding:16px 20px;
+      display:flex;
+      justify-content:space-between;
+      gap:16px;
+      align-items:center;
+      flex-wrap:wrap
+    }
+    .brand{display:flex;align-items:center;gap:12px}
+    .logo{width:34px;height:34px;color:var(--primary)}
+    .brand h1{
+      font-size:clamp(1.5rem,1.2rem + 1.25vw,2.25rem);
+      letter-spacing:-.03em
+    }
+    .brand p{
+      color:var(--muted);
+      font-size:clamp(.875rem,.8rem + .35vw,1rem)
+    }
+    .toolbar{display:flex;gap:12px;align-items:center}
+    .btn{
+      min-height:44px;
+      border-radius:8px;
+      border:1px solid transparent;
+      background:var(--primary);
+      color:var(--inverse);
+      padding:0 16px;
+      cursor:pointer;
+      font-size:.875rem;
+      font-weight:600
+    }
+    .btn:hover{background:var(--primary2)}
+    .btn-ghost{
+      background:var(--surface2);
+      color:var(--text);
+      border-color:rgb(from var(--text) r g b / .12)
+    }
+    .layout{
+      display:grid;
+      grid-template-columns:300px minmax(0,1fr) 280px;
+      gap:24px;
+      align-items:start
+    }
+    .sidebar,.meta{display:grid;gap:16px}
+    .panel{border-radius:16px;padding:16px}
+    .panel h2{font-size:1.25rem;margin-bottom:8px}
+    .status-row{
+      display:flex;
+      justify-content:space-between;
+      gap:12px;
+      align-items:center;
+      margin-bottom:12px
+    }
+    .live-badge{
+      display:inline-flex;
+      align-items:center;
+      gap:8px;
+      padding:.35rem .65rem;
+      border-radius:9999px;
+      background:rgb(from var(--primary) r g b / .13);
+      color:var(--primary);
+      font-size:.75rem;
+      text-transform:uppercase;
+      letter-spacing:.08em;
+      font-weight:700
+    }
+    .dot{width:9px;height:9px;border-radius:50%;background:currentColor}
+    .clock-card{
+      display:grid;
+      gap:8px;
+      padding:16px;
+      border-radius:12px;
+      background:var(--surface2);
+      border:1px solid rgb(from var(--text) r g b / .1)
+    }
+    .clock-label{
+      display:flex;
+      justify-content:space-between;
+      gap:12px;
+      color:var(--muted);
+      font-size:.875rem
+    }
+    .player-name{font-weight:700}
+    .clock-time{
+      font-size:clamp(2rem,1.4rem + 2vw,3rem);
+      line-height:1;
+      font-weight:700;
+      letter-spacing:-.04em;
+      font-variant-numeric:tabular-nums lining-nums
+    }
+    .clock-time.low{color:var(--warning)}
+    .clock-time.flag{color:var(--error)}
+    .board-shell{display:grid;gap:16px}
+    .board-frame{
+      border-radius:24px;
+      padding:16px;
+      background:linear-gradient(180deg,rgb(from var(--surface2) r g b / .96),rgb(from var(--surface) r g b / .96));
+      border:1px solid rgb(from var(--text) r g b / .08);
+      box-shadow:var(--shadow2)
+    }
+    .board-stage{
+      width:min(100%,860px);
+      margin:0 auto;
+      aspect-ratio:400 / 444
+    }
+    .board-stage iframe{
+      width:100%;
+      height:100%;
+      border:0;
+      border-radius:18px;
+      background:#0f0f0f;
+      display:block
+    }
+    .eval-wrap{display:grid;gap:12px}
+    .eval-bar{
+      position:relative;
+      height:360px;
+      width:36px;
+      border-radius:9999px;
+      overflow:hidden;
+      background:#0d0d0d;
+      border:1px solid rgb(from var(--text) r g b / .12)
+    }
+    .eval-white,.eval-black{
+      position:absolute;
+      left:0;
+      width:100%;
+      transition:height .32s ease
+    }
+    .eval-white{bottom:0;background:#f5f2ea}
+    .eval-black{top:0;background:#1a1a1a}
+    .eval-marker{
+      position:absolute;
+      left:0;
+      width:100%;
+      height:2px;
+      background:var(--primary);
+      transform:translateY(-1px)
+    }
+    .eval-score{
+      font-size:1.25rem;
+      font-weight:700;
+      font-variant-numeric:tabular-nums lining-nums
+    }
+    .muted{color:var(--muted);font-size:.875rem}
+    .small{color:var(--faint);font-size:.75rem}
+    .stat-grid,.meta-list{display:grid;gap:12px}
+    .stat{
+      border-radius:12px;
+      padding:12px 16px
+    }
+    .label{
+      color:var(--muted);
+      font-size:.75rem;
+      text-transform:uppercase;
+      letter-spacing:.08em;
+      margin-bottom:6px
+    }
+    .value{
+      font-size:1rem;
+      font-weight:700;
+      word-break:break-word
+    }
+    .meta-item{
+      display:flex;
+      justify-content:space-between;
+      gap:12px;
+      color:var(--muted);
+      font-size:.875rem
+    }
+    .meta-item strong{
+      color:var(--text);
+      font-weight:700;
+      text-align:right;
+      font-variant-numeric:tabular-nums lining-nums
+    }
+    .footer{
+      border-radius:16px;
+      padding:16px 20px;
+      color:var(--muted);
+      font-size:.875rem
+    }
+    @media (max-width:1120px){
+      .layout{grid-template-columns:1fr}
+      .sidebar,.meta{grid-template-columns:repeat(auto-fit,minmax(240px,1fr))}
+    }
+    @media (max-width:640px){
+      body{padding:16px}
+      .topbar,.panel,.footer,.board-frame{padding:16px}
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <svg class="logo" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg" aria-label="Classical TV logo">
+          <rect x="6" y="6" width="36" height="36" rx="10" stroke="currentColor" stroke-width="3"/>
+          <path d="M17 31V17H31" stroke="currentColor" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M19 29L29 19" stroke="currentColor" stroke-width="3.5" stroke-linecap="round"/>
+        </svg>
+        <div>
+          <h1>Lichess TV Classical</h1>
+          <p>Streaming the live classical game and evaluating each new position.</p>
+        </div>
+      </div>
+      <div class="toolbar">
+        <button class="btn" id="refreshBtn">Reconnect</button>
+        <button class="btn btn-ghost" id="themeBtn" aria-label="Switch theme">☀️</button>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="sidebar">
+        <div class="panel">
+          <div class="status-row">
+            <h2>Live clocks</h2>
+            <div class="live-badge"><span class="dot"></span><span id="liveState">Connecting</span></div>
+          </div>
+          <div class="clock-card">
+            <div class="clock-label"><span>White</span><span class="player-name" id="whiteName">Waiting…</span></div>
+            <div class="clock-time" id="whiteClock">--:--</div>
+            <div class="small" id="whiteRating">Rating —</div>
+          </div>
+          <div style="height:12px"></div>
+          <div class="clock-card">
+            <div class="clock-label"><span>Black</span><span class="player-name" id="blackName">Waiting…</span></div>
+            <div class="clock-time" id="blackClock">--:--</div>
+            <div class="small" id="blackRating">Rating —</div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h2>Match state</h2>
+          <div class="stat-grid">
+            <div class="stat"><div class="label">Status</div><div class="value" id="gameStatus">Locating classical TV game</div></div>
+            <div class="stat"><div class="label">Turn</div><div class="value" id="sideToMove">—</div></div>
+            <div class="stat"><div class="label">Last move</div><div class="value" id="lastMove">—</div></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="board-shell">
+        <div class="board-frame">
+          <div class="board-stage">
+            <iframe
+              id="boardFrame"
+              src="https://lichess.org/tv/classical/frame?theme=brown&bg=dark"
+              title="Lichess Classical TV board"
+              allowtransparency="true"></iframe>
+          </div>
+        </div>
+        <div class="footer">
+          This page uses the classical TV channel once to get the current game ID, then keeps one live NDJSON game stream open until the game ends.
+          It uses the first stream object for players and later objects for the latest FEN and clocks.
+        </div>
+      </section>
+
+      <aside class="meta">
+        <div class="panel">
+          <h2>Evaluation</h2>
+          <div class="eval-wrap">
+            <div class="eval-bar">
+              <div class="eval-black" id="evalBlack" style="height:50%"></div>
+              <div class="eval-white" id="evalWhite" style="height:50%"></div>
+              <div class="eval-marker" id="evalMarker" style="top:50%"></div>
+            </div>
+            <div>
+              <div class="eval-score" id="evalScore">—</div>
+              <div class="muted" id="evalText">Waiting for stream</div>
+              <div class="small" id="fenPreview">FEN unavailable</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h2>Game metadata</h2>
+          <div class="meta-list">
+            <div class="meta-item"><span>Game ID</span><strong id="gameId">—</strong></div>
+            <div class="meta-item"><span>Variant</span><strong id="variant">—</strong></div>
+            <div class="meta-item"><span>Speed</span><strong id="speed">—</strong></div>
+            <div class="meta-item"><span>Rated</span><strong id="rated">—</strong></div>
+            <div class="meta-item"><span>Moves</span><strong id="moveCount">—</strong></div>
+            <div class="meta-item"><span>Updated</span><strong id="updatedAt">—</strong></div>
+          </div>
+        </div>
+      </aside>
+    </main>
+  </div>
+
+  <script>
+    (() => {
+      const state = {
+        gameId: null,
+        playersLoaded: false,
+        lastFen: null,
+        streamAbort: null,
+        theme: matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+      };
+
+      const el = id => document.getElementById(id);
+      const html = document.documentElement;
+      const themeBtn = el('themeBtn');
+
+      html.setAttribute('data-theme', state.theme);
+
+      function setTheme(next) {
+        state.theme = next;
+        html.setAttribute('data-theme', next);
+        themeBtn.textContent = next === 'dark' ? '☀️' : '🌙';
+      }
+
+      setTheme(state.theme);
+      themeBtn.addEventListener('click', () => setTheme(state.theme === 'dark' ? 'light' : 'dark'));
+
+      function fmtClock(x) {
+        if (x == null || Number.isNaN(x)) return '--:--';
+        const s = Math.max(0, Math.round(x / 100));
+        const m = Math.floor(s / 60);
+        const r = s % 60;
+        return `${m}:${String(r).padStart(2, '0')}`;
+      }
+
+      function clkClass(node, x) {
+        const s = x == null ? null : Math.round(x / 100);
+        node.classList.toggle('low', s != null && s <= 60 && s > 10);
+        node.classList.toggle('flag', s != null && s <= 10);
+      }
+
+      function scoreText(cp, mate) {
+        if (mate != null) return mate > 0 ? `Mate for White in ${mate}` : `Mate for Black in ${Math.abs(mate)}`;
+        if (cp == null) return 'Evaluation unavailable';
+        if (cp > 250) return 'White is clearly better';
+        if (cp > 80) return 'White is slightly better';
+        if (cp < -250) return 'Black is clearly better';
+        if (cp < -80) return 'Black is slightly better';
+        return 'Balanced position';
+      }
+
+      function scoreDisplay(cp, mate) {
+        if (mate != null) return `M${mate}`;
+        if (cp == null) return '—';
+        return `${cp > 0 ? '+' : ''}${(cp / 100).toFixed(1)}`;
+      }
+
+      function scorePercent(cp, mate) {
+        if (mate != null) return mate > 0 ? 100 : 0;
+        const b = Math.max(-800, Math.min(800, cp || 0));
+        return 50 + b / 16;
+      }
+
+      function paintEval(cp, mate) {
+        const p = Math.max(0, Math.min(100, scorePercent(cp, mate)));
+        el('evalWhite').style.height = `${p}%`;
+        el('evalBlack').style.height = `${100 - p}%`;
+        el('evalMarker').style.top = `${100 - p}%`;
+        el('evalScore').textContent = scoreDisplay(cp, mate);
+        el('evalText').textContent = scoreText(cp, mate);
+      }
+
+      async function getJson(url, opts = {}) {
+        const r = await fetch(url, { ...opts, headers: { Accept: 'application/json', ...(opts.headers || {}) } });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      }
+
+      async function getClassicalGame() {
+        const data = await getJson('https://lichess.org/api/tv/channels');
+        if (!data.classical?.gameId) throw new Error('No active classical TV game found.');
+        return data.classical.gameId;
+      }
+
+      async function getEval(fen) {
+        const data = await getJson(`https://stockfish.online/api/s/v2.php?fen=${encodeURIComponent(fen)}&depth=12`);
+        if (data.success === false) throw new Error(data.data || 'Stockfish API error');
+        const p = data.data || data;
+        let e = p.evaluation ?? p.eval ?? null;
+        if (typeof e === 'string') e = Number(e);
+        let m = p.mate ?? null;
+        if (typeof m === 'string') m = Number(m);
+        return {
+          cp: Number.isFinite(e) ? Math.round(e * 100) : null,
+          mate: Number.isFinite(m) ? m : null,
+          depth: p.depth ?? null
+        };
+      }
+
+      async function evalIfChanged(fen) {
+        if (!fen || fen === state.lastFen) return;
+        state.lastFen = fen;
+        el('fenPreview').textContent = fen;
+        try {
+          const e = await getEval(fen);
+          paintEval(e.cp, e.mate);
+          if (e.depth != null) el('evalText').textContent = `${el('evalText').textContent} · depth ${e.depth}`;
+        } catch (err) {
+          paintEval(null, null);
+          el('evalText').textContent = `Eval offline: ${err.message}`;
+        }
+      }
+
+      function updateFromStream(data) {
+        const fen = data.fen || null;
+        const lm = data.lm || data.lastMove || '—';
+        const wc = data.wc ?? null;
+        const bc = data.bc ?? null;
+
+        if (!state.playersLoaded && data.players) {
+          el('whiteName').textContent = data.players.white?.user?.name || data.players.white?.name || 'White';
+          el('blackName').textContent = data.players.black?.user?.name || data.players.black?.name || 'Black';
+          el('whiteRating').textContent = `Rating ${data.players.white?.rating ?? '—'}`;
+          el('blackRating').textContent = `Rating ${data.players.black?.rating ?? '—'}`;
+          state.playersLoaded = true;
+        }
+
+        if (fen) {
+          el('sideToMove').textContent = fen.split(' ')[1] === 'w' ? 'White to move' : 'Black to move';
+          el('fenPreview').textContent = fen;
+        }
+
+        if (wc != null) {
+          el('whiteClock').textContent = fmtClock(wc);
+          clkClass(el('whiteClock'), wc);
+        }
+
+        if (bc != null) {
+          el('blackClock').textContent = fmtClock(bc);
+          clkClass(el('blackClock'), bc);
+        }
+
+        if (data.status?.name || data.status) el('gameStatus').textContent = data.status?.name || data.status;
+        if (data.variant?.name || data.variant) el('variant').textContent = data.variant?.name || data.variant;
+        if (data.speed) el('speed').textContent = data.speed;
+        if (typeof data.rated === 'boolean') el('rated').textContent = data.rated ? 'Rated' : 'Casual';
+        if (data.turns != null) el('moveCount').textContent = String(data.turns);
+        if (data.id) el('gameId').textContent = data.id;
+
+        el('lastMove').textContent = lm;
+        el('updatedAt').textContent = new Date().toLocaleTimeString();
+        el('liveState').textContent = 'Streaming';
+
+        if (fen) evalIfChanged(fen);
+      }
+
+      async function streamGame(gameId) {
+        if (state.streamAbort) state.streamAbort.abort();
+        state.streamAbort = new AbortController();
+
+        el('liveState').textContent = 'Streaming';
+
+        const res = await fetch(`https://lichess.org/api/stream/game/${gameId}`, {
+          headers: { Accept: 'application/x-ndjson' },
+          signal: state.streamAbort.signal
+        });
+
+        if (!res.ok || !res.body) throw new Error(`Stream HTTP ${res.status}`);
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+
+          buf += decoder.decode(value, { stream: true });
+          const lines = buf.split('\n');
+          buf = lines.pop() || '';
+
+          for (const line of lines) {
+            const t = line.trim();
+            if (!t) continue;
+            try {
+              updateFromStream(JSON.parse(t));
+            } catch (e) {
+              console.error(e);
+            }
+          }
+        }
+      }
+
+      async function start() {
+        el('gameStatus').textContent = 'Locating classical TV game';
+        try {
+          const gameId = await getClassicalGame();
+          state.gameId = gameId;
+          el('gameId').textContent = gameId;
+          await streamGame(gameId);
+          el('liveState').textContent = 'Ended';
+        } catch (err) {
+          el('gameStatus').textContent = err.message;
+          el('liveState').textContent = 'Error';
+        }
+      }
+
+      el('refreshBtn').addEventListener('click', () => {
+        start();
+      });
+
+      start();
+    })();
+  </script>
+</body>
+</html>
