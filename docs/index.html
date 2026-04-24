@@ -557,7 +557,7 @@
           <div class="winpred-wrap">
             <div class="winpred-head">
               <div class="label">Win predictor</div>
-              <div class="small" id="winPredText">Waiting for computed probabilities</div>
+              <div class="small" id="winPredText">Waiting for Win Predictions</div>
             </div>
 
             <div class="winpred-bar" aria-label="White win draw black win prediction">
@@ -627,15 +627,15 @@
       lastFen: null,
       streamAbort: null,
       theme: matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light",
-      lastApiKey: null,
-      apiCache: new Map(),
-      apiPending: new Set(),
       whiteRating: null,
       blackRating: null,
       whiteClock: null,
       blackClock: null,
       latestEvalCp: null,
       latestEvalMate: null,
+      apiCache: new Map(),
+      apiPending: new Set(),
+      dbPredictionKeysPainted: new Set(),
     };
 
     const el = id => document.getElementById(id);
@@ -726,7 +726,7 @@
       return `${Math.round(x * 100)}%`;
     }
 
-    function clearWinPredictor(text = "Waiting for computed probabilities") {
+    function clearWinPredictor(text = "Waiting for Predictions") {
       el("winWhite").style.width = "0%";
       el("winDraw").style.width = "0%";
       el("winBlack").style.width = "0%";
@@ -738,10 +738,7 @@
 
     function paintWinPredictor(probs, sourceText) {
       const p = normalizeComputedProbs(probs);
-      if (!p) {
-        clearWinPredictor(sourceText || "Waiting for computed probabilities");
-        return false;
-      }
+      if (!p) return false;
 
       el("winWhite").style.width = pct(p.white_win);
       el("winDraw").style.width = pct(p.draw);
@@ -763,6 +760,12 @@
         turn: Math.ceil(turns / 2),
         sideToMove: turns % 2 === 1 ? "w" : "b",
       };
+    }
+
+    function predictionKey(gameId, turns) {
+      const { turn, sideToMove } = getTurnAndSide(turns);
+      if (!gameId || turn == null || !sideToMove) return null;
+      return `${gameId}:${turn}:${sideToMove}`;
     }
 
     function safeRatio(a, b, fallback = null) {
@@ -809,13 +812,19 @@
       let white = 0;
       let black = 0;
 
-      if (evalScore > 0) {
+      if (evalScore < 1 && evalScore > -1) {
+        white = base * evalScore;
+        black = base * evalScore;
+        white = Math.min(0.8, white);
+        black = Math.min(0.8, black);
+      }
+      else if (evalScore > 0) {
         white = base * (evalScore / 3);
-        black = base * (-(1 / evalScore) / 3);
+        black = (1/base) * ((1 / evalScore) / 3);
         white = Math.min(0.8, white);
       } else if (evalScore < 0) {
         white = base * (-(1 / evalScore) / 3);
-        black = base * ((-evalScore) / 3);
+        black = (1/base) * ((-evalScore) / 3);
         black = Math.min(0.8, black);
       }
 
@@ -838,10 +847,14 @@
       });
     }
 
-    function predictionKey(gameId, turns) {
-      const { turn, sideToMove } = getTurnAndSide(turns);
-      if (!gameId || turn == null || !sideToMove) return null;
-      return `${gameId}:${turn}:${sideToMove}`;
+    function renderImmediateFallback() {
+      const probs = fallbackWinPredictor();
+      if (probs) {
+        paintWinPredictor(probs, "Win Predictions");
+        return true;
+      }
+      clearWinPredictor("Waiting for clocks and ratings");
+      return false;
     }
 
     async function fetchPrediction(gameId, turns) {
@@ -859,13 +872,36 @@
       url.searchParams.set("side_to_move", sideToMove);
 
       const res = await fetch(url.toString());
-      if (!res.ok) {
-        throw new Error(`Prediction HTTP ${res.status}`);
-      }
+      if (!res.ok) throw new Error(`Prediction HTTP ${res.status}`);
 
       const row = await res.json();
       state.apiCache.set(key, row);
       return row;
+    }
+
+    async function requestDbPrediction(data) {
+      if (!data?.id || data.turns == null) return;
+
+      const key = predictionKey(data.id, data.turns);
+      if (!key || state.apiPending.has(key)) return;
+
+      try {
+        state.apiPending.add(key);
+        const row = await fetchPrediction(data.id, data.turns);
+
+        if (row && row.probabilities) {
+          paintWinPredictor(
+            row.probabilities,
+            row.predicted_label ? `Model: ${row.predicted_label}` : "Model data loaded"
+          );
+          state.dbPredictionKeysPainted.add(key);
+        }
+      } catch (err) {
+        renderImmediateFallback();
+        el("winPredText").textContent = `Fallback model: ${err.message}`;
+      } finally {
+        state.apiPending.delete(key);
+      }
     }
 
     async function getJson(url, opts = {}) {
@@ -901,7 +937,7 @@
       };
     }
 
-    async function evalIfChanged(fen) {
+    async function evalIfChangedAndRepaint(fen, data) {
       if (!fen || fen === state.lastFen) return;
       state.lastFen = fen;
       el("fenPreview").textContent = fen;
@@ -914,47 +950,17 @@
         if (e.depth != null) {
           el("evalText").textContent = `${el("evalText").textContent} · depth ${e.depth}`;
         }
+
+        const key = predictionKey(data?.id, data?.turns);
+        if (!key || !state.dbPredictionKeysPainted.has(key)) {
+          renderImmediateFallback();
+        }
       } catch (err) {
         state.latestEvalCp = null;
         state.latestEvalMate = null;
         paintEval(null, null);
         el("evalText").textContent = `Eval offline: ${err.message}`;
-      }
-    }
-
-    async function tryRenderWinPredictor(data) {
-      if (!data?.id || data.turns == null) return;
-
-      const key = predictionKey(data.id, data.turns);
-      const fallback = fallbackWinPredictor();
-
-      if (fallback) {
-        paintWinPredictor(fallback, "Fallback model");
-      } else {
-        clearWinPredictor("Waiting for clocks, ratings, and eval");
-      }
-
-      if (!key || state.apiPending.has(key)) return;
-
-      try {
-        state.apiPending.add(key);
-        const row = await fetchPrediction(data.id, data.turns);
-
-        if (row && row.probabilities) {
-          paintWinPredictor(
-            row.probabilities,
-            row.predicted_label ? `Model: ${row.predicted_label}` : "Model data loaded"
-          );
-        }
-      } catch (err) {
-        const probs = fallbackWinPredictor();
-        if (probs) {
-          paintWinPredictor(probs, `Fallback model: ${err.message}`);
-        } else {
-          clearWinPredictor(`Waiting for fallback inputs: ${err.message}`);
-        }
-      } finally {
-        state.apiPending.delete(key);
+        renderImmediateFallback();
       }
     }
 
@@ -1010,10 +1016,11 @@
       el("updatedAt").textContent = new Date().toLocaleTimeString();
       el("liveState").textContent = "Streaming";
 
+      renderImmediateFallback();
+      requestDbPrediction(data);
+
       if (fen) {
-        evalIfChanged(fen).finally(() => tryRenderWinPredictor(data));
-      } else {
-        tryRenderWinPredictor(data);
+        evalIfChangedAndRepaint(fen, data);
       }
     }
 
@@ -1056,22 +1063,22 @@
 
     async function start() {
       el("gameStatus").textContent = "Locating classical TV game";
-      clearWinPredictor("Waiting for computed probabilities");
+      clearWinPredictor("Waiting for clocks and ratings");
 
       try {
         const gameId = await getClassicalGame();
         state.gameId = gameId;
         state.playersLoaded = false;
         state.lastFen = null;
-        state.lastApiKey = null;
-        state.apiCache = new Map();
-        state.apiPending = new Set();
         state.latestEvalCp = null;
         state.latestEvalMate = null;
         state.whiteRating = null;
         state.blackRating = null;
         state.whiteClock = null;
         state.blackClock = null;
+        state.apiCache = new Map();
+        state.apiPending = new Set();
+        state.dbPredictionKeysPainted = new Set();
         el("gameId").textContent = gameId;
 
         await streamGame(gameId);
