@@ -618,18 +618,8 @@
     </main>
   </div>
 
-  <script type="module">
-    import { Client } from "https://esm.sh/pg@8.11.5?bundle";
-
-    const PG_CONFIG = {
-      host: "34.61.210.71",
-      port: 5432,
-      database: "lichess_db",
-      user: "website_reader",
-      password: "website_reader",
-      ssl: "require"
-    };
-
+  <script>
+    const API_BASE = "https://chess-win-predictor-api-547168098912.us-central1.run.app";
     const DEFAULT_PROBS_FALLBACK = {
       white_win: 0.17,
       draw: 0.7,
@@ -643,8 +633,6 @@
       streamAbort: null,
       theme: matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light",
       lastWinPredKey: null,
-      pgClient: null,
-      pgReady: false,
       whiteRating: null,
       blackRating: null,
       whiteClock: null,
@@ -820,17 +808,6 @@
       });
     }
 
-    async function ensurePg() {
-      if (state.pgReady && state.pgClient) return state.pgClient;
-
-      const client = new Client(PG_CONFIG);
-      await client.connect();
-
-      state.pgClient = client;
-      state.pgReady = true;
-      return client;
-    }
-
     async function getWinPrediction(gameId, turns) {
       const { turn, sideToMove } = getTurnAndSide(turns);
       if (!gameId || turn == null || !sideToMove) return null;
@@ -839,21 +816,17 @@
       if (state.lastWinPredKey === cacheKey) return null;
       state.lastWinPredKey = cacheKey;
 
-      const client = await ensurePg();
-      const sql = `
-        SELECT probabilities, predicted_label
-        FROM public.lichess_move_predictions
-        WHERE game_id = $1
-          AND turn = $2
-          AND side_to_move = $3
-        LIMIT 1
-      `;
+      const url = new URL(`${API_BASE}/prediction`);
+      url.searchParams.set("game_id", gameId);
+      url.searchParams.set("turn", String(turn));
+      url.searchParams.set("side_to_move", sideToMove);
 
-      const result = await client.query(sql, [gameId, turn, sideToMove]);
-      if (!result.rows.length) {
-        throw new Error("No prediction row found");
+      const res = await fetch(url.toString());
+      if (!res.ok) {
+        throw new Error(`Prediction HTTP ${res.status}`);
       }
-      return result.rows[0];
+
+      return res.json();
     }
 
     async function getJson(url, opts = {}) {
@@ -1033,14 +1006,6 @@
         state.latestEvalMate = null;
         el("gameId").textContent = gameId;
 
-        try {
-          await ensurePg();
-          el("winPredText").textContent = "Prediction database connected";
-        } catch (dbErr) {
-          const probs = fallbackWinPredictor();
-          paintWinPredictor(probs, `Fallback model: ${dbErr.message}`);
-        }
-
         await streamGame(gameId);
         el("liveState").textContent = "Ended";
       } catch (err) {
@@ -1048,13 +1013,6 @@
         el("liveState").textContent = "Error";
       }
     }
-
-    window.addEventListener("beforeunload", async () => {
-      try {
-        if (state.streamAbort) state.streamAbort.abort();
-        if (state.pgClient) await state.pgClient.end();
-      } catch {}
-    });
 
     el("refreshBtn").addEventListener("click", start);
 
