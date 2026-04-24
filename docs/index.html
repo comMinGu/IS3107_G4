@@ -557,19 +557,19 @@
           <div class="winpred-wrap">
             <div class="winpred-head">
               <div class="label">Win predictor</div>
-              <div class="small" id="winPredText">Waiting for model data</div>
+              <div class="small" id="winPredText">Waiting for computed probabilities</div>
             </div>
 
             <div class="winpred-bar" aria-label="White win draw black win prediction">
-              <div class="seg seg-white" id="winWhite" style="width:33.33%"></div>
-              <div class="seg seg-draw" id="winDraw" style="width:33.34%"></div>
-              <div class="seg seg-black" id="winBlack" style="width:33.33%"></div>
+              <div class="seg seg-white" id="winWhite" style="width:0%"></div>
+              <div class="seg seg-draw" id="winDraw" style="width:0%"></div>
+              <div class="seg seg-black" id="winBlack" style="width:0%"></div>
             </div>
 
             <div class="winpred-meta">
-              <span id="winWhiteLabel">White 33%</span>
-              <span id="winDrawLabel">Draw 33%</span>
-              <span id="winBlackLabel">Black 33%</span>
+              <span id="winWhiteLabel">White —</span>
+              <span id="winDrawLabel">Draw —</span>
+              <span id="winBlackLabel">Black —</span>
             </div>
           </div>
 
@@ -621,19 +621,15 @@
   <script>
     const API_BASE = "https://chess-win-predictor-api-547168098912.us-central1.run.app";
 
-    const INITIAL_PROBS = {
-      white_win: 0.3333,
-      draw: 0.3334,
-      black_win: 0.3333,
-    };
-
     const state = {
       gameId: null,
       playersLoaded: false,
       lastFen: null,
       streamAbort: null,
       theme: matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light",
-      lastWinPredKey: null,
+      lastApiKey: null,
+      apiCache: new Map(),
+      apiPending: new Set(),
       whiteRating: null,
       blackRating: null,
       whiteClock: null,
@@ -711,13 +707,13 @@
       return Math.max(0, Math.min(1, n));
     }
 
-    function normalizeProbs(probs) {
+    function normalizeComputedProbs(probs) {
       const white = clamp01(probs?.white_win);
       const draw = clamp01(probs?.draw);
       const black = clamp01(probs?.black_win);
       const total = white + draw + black;
 
-      if (total <= 0) return INITIAL_PROBS;
+      if (total <= 0) return null;
 
       return {
         white_win: white / total,
@@ -730,8 +726,22 @@
       return `${Math.round(x * 100)}%`;
     }
 
-    function paintWinPredictor(probs, sourceText = "Model data loaded") {
-      const p = normalizeProbs(probs);
+    function clearWinPredictor(text = "Waiting for computed probabilities") {
+      el("winWhite").style.width = "0%";
+      el("winDraw").style.width = "0%";
+      el("winBlack").style.width = "0%";
+      el("winWhiteLabel").textContent = "White —";
+      el("winDrawLabel").textContent = "Draw —";
+      el("winBlackLabel").textContent = "Black —";
+      el("winPredText").textContent = text;
+    }
+
+    function paintWinPredictor(probs, sourceText) {
+      const p = normalizeComputedProbs(probs);
+      if (!p) {
+        clearWinPredictor(sourceText || "Waiting for computed probabilities");
+        return false;
+      }
 
       el("winWhite").style.width = pct(p.white_win);
       el("winDraw").style.width = pct(p.draw);
@@ -740,8 +750,8 @@
       el("winWhiteLabel").textContent = `White ${pct(p.white_win)}`;
       el("winDrawLabel").textContent = `Draw ${pct(p.draw)}`;
       el("winBlackLabel").textContent = `Black ${pct(p.black_win)}`;
-
-      el("winPredText").textContent = sourceText;
+      el("winPredText").textContent = sourceText || "Computed probabilities";
+      return true;
     }
 
     function getTurnAndSide(turns) {
@@ -755,26 +765,45 @@
       };
     }
 
-    function getEvalScalar() {
-      if (state.latestEvalMate != null) {
-        return state.latestEvalMate > 0 ? 3 : -3;
-      }
-      if (state.latestEvalCp == null) return 0;
-      const pawns = state.latestEvalCp / 100;
-      return Math.max(-3, Math.min(3, pawns));
-    }
-
-    function safeRatio(a, b, fallback = 1) {
+    function safeRatio(a, b, fallback = null) {
       const x = Number(a);
       const y = Number(b);
       if (!Number.isFinite(x) || !Number.isFinite(y) || y <= 0 || x < 0) return fallback;
       return x / y;
     }
 
-    function fallbackWinPredictor() {
-      const evalScore = getEvalScalar();
+    function getHeuristicEdge() {
       const timeRatio = safeRatio(state.whiteClock, state.blackClock, 1);
       const ratingRatio = safeRatio(state.whiteRating, state.blackRating, 1);
+      return timeRatio * ratingRatio;
+    }
+
+    function getEvalScalar() {
+      if (state.latestEvalMate != null) {
+        return state.latestEvalMate > 0 ? 3 : -3;
+      }
+
+      if (state.latestEvalCp != null && Number.isFinite(state.latestEvalCp)) {
+        const pawns = state.latestEvalCp / 100;
+        if (pawns > 0) return Math.max(0.15, Math.min(3, pawns));
+        if (pawns < 0) return Math.min(-0.15, Math.max(-3, pawns));
+      }
+
+      const edge = getHeuristicEdge();
+      if (edge > 1.02) return 0.15;
+      if (edge < 0.98) return -0.15;
+      return 0.15;
+    }
+
+    function fallbackWinPredictor() {
+      const timeRatio = safeRatio(state.whiteClock, state.blackClock, null);
+      const ratingRatio = safeRatio(state.whiteRating, state.blackRating, null);
+
+      if (timeRatio == null || ratingRatio == null) {
+        return null;
+      }
+
+      const evalScore = getEvalScalar();
       const base = timeRatio * ratingRatio;
 
       let white = 0;
@@ -802,21 +831,28 @@
       let draw = 1 - white - black;
       draw = Math.max(0, draw);
 
-      return normalizeProbs({
+      return normalizeComputedProbs({
         white_win: white,
         draw,
         black_win: black,
       });
     }
 
-    async function getWinPrediction(gameId, turns) {
+    function predictionKey(gameId, turns) {
       const { turn, sideToMove } = getTurnAndSide(turns);
       if (!gameId || turn == null || !sideToMove) return null;
+      return `${gameId}:${turn}:${sideToMove}`;
+    }
 
-      const cacheKey = `${gameId}:${turn}:${sideToMove}`;
-      if (state.lastWinPredKey === cacheKey) return null;
-      state.lastWinPredKey = cacheKey;
+    async function fetchPrediction(gameId, turns) {
+      const key = predictionKey(gameId, turns);
+      if (!key) return null;
 
+      if (state.apiCache.has(key)) {
+        return state.apiCache.get(key);
+      }
+
+      const { turn, sideToMove } = getTurnAndSide(turns);
       const url = new URL(`${API_BASE}/prediction`);
       url.searchParams.set("game_id", gameId);
       url.searchParams.set("turn", String(turn));
@@ -827,7 +863,9 @@
         throw new Error(`Prediction HTTP ${res.status}`);
       }
 
-      return res.json();
+      const row = await res.json();
+      state.apiCache.set(key, row);
+      return row;
     }
 
     async function getJson(url, opts = {}) {
@@ -884,22 +922,40 @@
       }
     }
 
-    function queueWinPrediction(data) {
+    async function tryRenderWinPredictor(data) {
       if (!data?.id || data.turns == null) return;
 
-      getWinPrediction(data.id, data.turns)
-        .then(row => {
-          if (!row) return;
+      const key = predictionKey(data.id, data.turns);
+      const fallback = fallbackWinPredictor();
 
+      if (fallback) {
+        paintWinPredictor(fallback, "Fallback model");
+      } else {
+        clearWinPredictor("Waiting for clocks, ratings, and eval");
+      }
+
+      if (!key || state.apiPending.has(key)) return;
+
+      try {
+        state.apiPending.add(key);
+        const row = await fetchPrediction(data.id, data.turns);
+
+        if (row && row.probabilities) {
           paintWinPredictor(
-            row.probabilities ?? fallbackWinPredictor(),
+            row.probabilities,
             row.predicted_label ? `Model: ${row.predicted_label}` : "Model data loaded"
           );
-        })
-        .catch(err => {
-          const probs = fallbackWinPredictor();
+        }
+      } catch (err) {
+        const probs = fallbackWinPredictor();
+        if (probs) {
           paintWinPredictor(probs, `Fallback model: ${err.message}`);
-        });
+        } else {
+          clearWinPredictor(`Waiting for fallback inputs: ${err.message}`);
+        }
+      } finally {
+        state.apiPending.delete(key);
+      }
     }
 
     function updateFromStream(data) {
@@ -908,16 +964,18 @@
       const wc = data.wc ?? null;
       const bc = data.bc ?? null;
 
-      if (!state.playersLoaded && data.players) {
-        el("whiteName").textContent = data.players.white?.user?.name || data.players.white?.name || "White";
-        el("blackName").textContent = data.players.black?.user?.name || data.players.black?.name || "Black";
+      if (data.players) {
+        state.whiteRating = Number(data.players.white?.rating ?? state.whiteRating);
+        state.blackRating = Number(data.players.black?.rating ?? state.blackRating);
 
-        state.whiteRating = Number(data.players.white?.rating ?? null);
-        state.blackRating = Number(data.players.black?.rating ?? null);
+        if (!state.playersLoaded) {
+          el("whiteName").textContent = data.players.white?.user?.name || data.players.white?.name || "White";
+          el("blackName").textContent = data.players.black?.user?.name || data.players.black?.name || "Black";
+          state.playersLoaded = true;
+        }
 
         el("whiteRating").textContent = `Rating ${data.players.white?.rating ?? "—"}`;
         el("blackRating").textContent = `Rating ${data.players.black?.rating ?? "—"}`;
-        state.playersLoaded = true;
       }
 
       if (fen) {
@@ -953,9 +1011,9 @@
       el("liveState").textContent = "Streaming";
 
       if (fen) {
-        evalIfChanged(fen).finally(() => queueWinPrediction(data));
+        evalIfChanged(fen).finally(() => tryRenderWinPredictor(data));
       } else {
-        queueWinPrediction(data);
+        tryRenderWinPredictor(data);
       }
     }
 
@@ -998,14 +1056,16 @@
 
     async function start() {
       el("gameStatus").textContent = "Locating classical TV game";
-      paintWinPredictor(INITIAL_PROBS, "Waiting for model data");
+      clearWinPredictor("Waiting for computed probabilities");
 
       try {
         const gameId = await getClassicalGame();
         state.gameId = gameId;
         state.playersLoaded = false;
         state.lastFen = null;
-        state.lastWinPredKey = null;
+        state.lastApiKey = null;
+        state.apiCache = new Map();
+        state.apiPending = new Set();
         state.latestEvalCp = null;
         state.latestEvalMate = null;
         state.whiteRating = null;
