@@ -264,6 +264,52 @@
       overflow: hidden;
     }
 
+    .winpred-wrap {
+      display: grid;
+      gap: 10px;
+      width: 100%;
+      max-width: 860px;
+      margin: 0 auto 16px;
+    }
+
+    .winpred-head,
+    .winpred-meta {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+      min-width: 0;
+    }
+
+    .winpred-bar {
+      display: flex;
+      width: 100%;
+      height: 22px;
+      overflow: hidden;
+      border-radius: 9999px;
+      background: var(--surface3);
+      border: 1px solid rgb(from var(--text) r g b / 0.12);
+      box-shadow: var(--shadow);
+    }
+
+    .seg {
+      height: 100%;
+      transition: width 0.32s ease;
+    }
+
+    .seg-white {
+      background: #f5f2ea;
+    }
+
+    .seg-draw {
+      background: color-mix(in srgb, var(--muted) 45%, var(--surface2));
+    }
+
+    .seg-black {
+      background: #1a1a1a;
+    }
+
     .board-stage {
       width: 100%;
       max-width: 860px;
@@ -427,6 +473,10 @@
       .eval-bar {
         height: 280px;
       }
+
+      .winpred-bar {
+        height: 18px;
+      }
     }
   </style>
 </head>
@@ -434,13 +484,7 @@
   <div class="app">
     <header class="topbar">
       <div class="brand">
-        <svg
-          class="logo"
-          viewBox="0 0 48 48"
-          fill="none"
-          xmlns="http://www.w3.org/2000/svg"
-          aria-label="Classical TV logo"
-        >
+        <svg class="logo" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg" aria-label="Classical TV logo">
           <rect x="6" y="6" width="36" height="36" rx="10" stroke="currentColor" stroke-width="3" />
           <path d="M17 31V17H31" stroke="currentColor" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round" />
           <path d="M19 29L29 19" stroke="currentColor" stroke-width="3.5" stroke-linecap="round" />
@@ -510,6 +554,25 @@
 
       <section class="board-shell">
         <div class="board-frame">
+          <div class="winpred-wrap">
+            <div class="winpred-head">
+              <div class="label">Win predictor</div>
+              <div class="small" id="winPredText">Waiting for model data</div>
+            </div>
+
+            <div class="winpred-bar" aria-label="White win draw black win prediction">
+              <div class="seg seg-white" id="winWhite" style="width:17%"></div>
+              <div class="seg seg-draw" id="winDraw" style="width:70%"></div>
+              <div class="seg seg-black" id="winBlack" style="width:13%"></div>
+            </div>
+
+            <div class="winpred-meta">
+              <span id="winWhiteLabel">White 17%</span>
+              <span id="winDrawLabel">Draw 70%</span>
+              <span id="winBlackLabel">Black 13%</span>
+            </div>
+          </div>
+
           <div class="board-stage">
             <iframe
               id="boardFrame"
@@ -535,7 +598,7 @@
               <div class="eval-marker" id="evalMarker" style="top: 50%"></div>
             </div>
             <div class="eval-score" id="evalScore">0.0</div>
-            <div class="muted" id="evalText">Waiting for stream…</div>
+            <div class="muted" id="evalText">Waiting for stream</div>
             <div class="small" id="fenPreview">FEN unavailable</div>
           </div>
         </div>
@@ -555,16 +618,42 @@
     </main>
   </div>
 
-  <script>
+  <script type="module">
+    import { Client } from "https://esm.sh/pg@8.11.5?bundle";
+
+    const PG_CONFIG = {
+      host: "34.61.210.71",
+      port: 5432,
+      database: "lichess_db",
+      user: "website_reader",
+      password: "website_reader",
+      ssl: "require"
+    };
+
+    const DEFAULT_PROBS_FALLBACK = {
+      white_win: 0.17,
+      draw: 0.7,
+      black_win: 0.13,
+    };
+
     const state = {
       gameId: null,
       playersLoaded: false,
       lastFen: null,
       streamAbort: null,
-      theme: matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"
+      theme: matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light",
+      lastWinPredKey: null,
+      pgClient: null,
+      pgReady: false,
+      whiteRating: null,
+      blackRating: null,
+      whiteClock: null,
+      blackClock: null,
+      latestEvalCp: null,
+      latestEvalMate: null,
     };
 
-    const el = (id) => document.getElementById(id);
+    const el = id => document.getElementById(id);
     const html = document.documentElement;
     const themeBtn = el("themeBtn");
 
@@ -574,13 +663,13 @@
       state.theme = next;
       html.setAttribute("data-theme", next);
       themeBtn.textContent = next === "dark" ? "Light" : "Dark";
+      const frame = el("boardFrame");
+      const bg = next === "dark" ? "dark" : "light";
+      frame.src = `https://lichess.org/tv/classical/frame?theme=brown&bg=${bg}`;
     }
 
     setTheme(state.theme);
-
-    themeBtn.addEventListener("click", () => {
-      setTheme(state.theme === "dark" ? "light" : "dark");
-    });
+    themeBtn.addEventListener("click", () => setTheme(state.theme === "dark" ? "light" : "dark"));
 
     function fmtClock(x) {
       if (x == null || Number.isNaN(x)) return "--:--";
@@ -592,24 +681,24 @@
 
     function clkClass(node, x) {
       const s = x == null ? null : Math.round(x);
-      node.classList.toggle("low", s !== null && s <= 60 && s > 10);
-      node.classList.toggle("flag", s !== null && s <= 10);
+      node.classList.toggle("low", s != null && s <= 60 && s > 10);
+      node.classList.toggle("flag", s != null && s <= 10);
     }
 
     function scoreText(cp, mate) {
       if (mate != null) return mate > 0 ? `Mate for White in ${mate}` : `Mate for Black in ${Math.abs(mate)}`;
       if (cp == null) return "Evaluation unavailable";
-      if (cp > 250) return "White is clearly better";
-      if (cp > 80) return "White is slightly better";
-      if (cp < -250) return "Black is clearly better";
-      if (cp < -80) return "Black is slightly better";
+      if (cp >= 250) return "White is clearly better";
+      if (cp >= 80) return "White is slightly better";
+      if (cp <= -250) return "Black is clearly better";
+      if (cp <= -80) return "Black is slightly better";
       return "Balanced position";
     }
 
     function scoreDisplay(cp, mate) {
       if (mate != null) return `M${mate}`;
       if (cp == null) return "—";
-      return cp > 0 ? `+${(cp / 100).toFixed(1)}` : (cp / 100).toFixed(1);
+      return (cp / 100).toFixed(1);
     }
 
     function scorePercent(cp, mate) {
@@ -627,13 +716,150 @@
       el("evalText").textContent = scoreText(cp, mate);
     }
 
+    function clamp01(x) {
+      const n = Number(x);
+      if (!Number.isFinite(n)) return 0;
+      return Math.max(0, Math.min(1, n));
+    }
+
+    function normalizeProbs(probs) {
+      const white = clamp01(probs?.white_win);
+      const draw = clamp01(probs?.draw);
+      const black = clamp01(probs?.black_win);
+      const total = white + draw + black;
+
+      if (total <= 0) return DEFAULT_PROBS_FALLBACK;
+
+      return {
+        white_win: white / total,
+        draw: draw / total,
+        black_win: black / total,
+      };
+    }
+
+    function pct(x) {
+      return `${Math.round(x * 100)}%`;
+    }
+
+    function paintWinPredictor(probs, sourceText = "Model data loaded") {
+      const p = normalizeProbs(probs);
+
+      el("winWhite").style.width = pct(p.white_win);
+      el("winDraw").style.width = pct(p.draw);
+      el("winBlack").style.width = pct(p.black_win);
+
+      el("winWhiteLabel").textContent = `White ${pct(p.white_win)}`;
+      el("winDrawLabel").textContent = `Draw ${pct(p.draw)}`;
+      el("winBlackLabel").textContent = `Black ${pct(p.black_win)}`;
+
+      el("winPredText").textContent = sourceText;
+    }
+
+    function getTurnAndSide(turns) {
+      if (!Number.isFinite(turns) || turns < 0) {
+        return { turn: null, sideToMove: null };
+      }
+
+      return {
+        turn: Math.ceil(turns / 2),
+        sideToMove: turns % 2 === 1 ? "w" : "b",
+      };
+    }
+
+    function getEvalScalar() {
+      if (state.latestEvalMate != null) {
+        return state.latestEvalMate > 0 ? 3 : -3;
+      }
+      if (state.latestEvalCp == null) return 0;
+      const pawns = state.latestEvalCp / 100;
+      return Math.max(-3, Math.min(3, pawns));
+    }
+
+    function safeRatio(a, b, fallback = 1) {
+      const x = Number(a);
+      const y = Number(b);
+      if (!Number.isFinite(x) || !Number.isFinite(y) || y <= 0 || x < 0) return fallback;
+      return x / y;
+    }
+
+    function fallbackWinPredictor() {
+      const evalScore = getEvalScalar();
+      const timeRatio = safeRatio(state.whiteClock, state.blackClock, 1);
+      const ratingRatio = safeRatio(state.whiteRating, state.blackRating, 1);
+      const base = timeRatio * ratingRatio;
+
+      let white = 0;
+      let black = 0;
+
+      if (evalScore > 0) {
+        white = base * (evalScore / 3);
+        black = base * (-(1 / evalScore) / 3);
+        white = Math.min(0.8, white);
+      } else if (evalScore < 0) {
+        white = base * (-(1 / evalScore) / 3);
+        black = base * ((-evalScore) / 3);
+        black = Math.min(0.8, black);
+      }
+
+      white = Math.max(0, Number.isFinite(white) ? white : 0);
+      black = Math.max(0, Number.isFinite(black) ? black : 0);
+
+      if (white + black > 0.95) {
+        const scale = 0.95 / (white + black);
+        white *= scale;
+        black *= scale;
+      }
+
+      let draw = 1 - white - black;
+      draw = Math.max(0, draw);
+
+      return normalizeProbs({
+        white_win: white,
+        draw,
+        black_win: black,
+      });
+    }
+
+    async function ensurePg() {
+      if (state.pgReady && state.pgClient) return state.pgClient;
+
+      const client = new Client(PG_CONFIG);
+      await client.connect();
+
+      state.pgClient = client;
+      state.pgReady = true;
+      return client;
+    }
+
+    async function getWinPrediction(gameId, turns) {
+      const { turn, sideToMove } = getTurnAndSide(turns);
+      if (!gameId || turn == null || !sideToMove) return null;
+
+      const cacheKey = `${gameId}:${turn}:${sideToMove}`;
+      if (state.lastWinPredKey === cacheKey) return null;
+      state.lastWinPredKey = cacheKey;
+
+      const client = await ensurePg();
+      const sql = `
+        SELECT probabilities, predicted_label
+        FROM public.lichess_move_predictions
+        WHERE game_id = $1
+          AND turn = $2
+          AND side_to_move = $3
+        LIMIT 1
+      `;
+
+      const result = await client.query(sql, [gameId, turn, sideToMove]);
+      if (!result.rows.length) {
+        throw new Error("No prediction row found");
+      }
+      return result.rows[0];
+    }
+
     async function getJson(url, opts = {}) {
       const r = await fetch(url, {
         ...opts,
-        headers: {
-          Accept: "application/json",
-          ...(opts.headers || {})
-        }
+        headers: { Accept: "application/json", ...(opts.headers || {}) }
       });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       return r.json();
@@ -649,11 +875,7 @@
       const data = await getJson(
         `https://stockfish.online/api/s/v2.php?fen=${encodeURIComponent(fen)}&depth=12`
       );
-
-      if (data.success === false) {
-        throw new Error(data.data || "Stockfish API error");
-      }
-
+      if (data.success === false) throw new Error(data.data || "Stockfish API error");
       const p = data.data ?? data;
       let e = p.evaluation ?? p.eval ?? null;
       if (typeof e === "string") e = Number(e);
@@ -663,7 +885,7 @@
       return {
         cp: Number.isFinite(e) ? Math.round(e * 100) : null,
         mate: Number.isFinite(m) ? m : null,
-        depth: p.depth ?? null
+        depth: p.depth ?? null,
       };
     }
 
@@ -674,25 +896,48 @@
 
       try {
         const e = await getEval(fen);
+        state.latestEvalCp = e.cp;
+        state.latestEvalMate = e.mate;
         paintEval(e.cp, e.mate);
-        if (e.depth != null) {
-          el("evalText").textContent = `${el("evalText").textContent} · depth ${e.depth}`;
-        }
+        if (e.depth != null) el("evalText").textContent = `${el("evalText").textContent} · depth ${e.depth}`;
       } catch (err) {
+        state.latestEvalCp = null;
+        state.latestEvalMate = null;
         paintEval(null, null);
-        el("evalText").textContent = `Eval offline · ${err.message}`;
+        el("evalText").textContent = `Eval offline: ${err.message}`;
       }
+    }
+
+    function queueWinPrediction(data) {
+      if (!data?.id || data.turns == null) return;
+
+      getWinPrediction(data.id, data.turns)
+        .then(row => {
+          if (!row) return;
+          paintWinPredictor(
+            row.probabilities ?? DEFAULT_PROBS_FALLBACK,
+            row.predicted_label ? `Model: ${row.predicted_label}` : "Model data loaded"
+          );
+        })
+        .catch(err => {
+          const probs = fallbackWinPredictor();
+          paintWinPredictor(probs, `Fallback model: ${err.message}`);
+        });
     }
 
     function updateFromStream(data) {
       const fen = data.fen ?? null;
-      const lm = data.lm ?? data.lastMove ?? "—";
+      const lm = data.lm ?? data.lastMove ?? "";
       const wc = data.wc ?? null;
       const bc = data.bc ?? null;
 
       if (!state.playersLoaded && data.players) {
         el("whiteName").textContent = data.players.white?.user?.name || data.players.white?.name || "White";
         el("blackName").textContent = data.players.black?.user?.name || data.players.black?.name || "Black";
+
+        state.whiteRating = Number(data.players.white?.rating ?? null);
+        state.blackRating = Number(data.players.black?.rating ?? null);
+
         el("whiteRating").textContent = `Rating ${data.players.white?.rating ?? "—"}`;
         el("blackRating").textContent = `Rating ${data.players.black?.rating ?? "—"}`;
         state.playersLoaded = true;
@@ -704,38 +949,43 @@
       }
 
       if (wc != null) {
+        state.whiteClock = Number(wc);
         el("whiteClock").textContent = fmtClock(wc);
         clkClass(el("whiteClock"), wc);
       }
 
       if (bc != null) {
+        state.blackClock = Number(bc);
         el("blackClock").textContent = fmtClock(bc);
         clkClass(el("blackClock"), bc);
       }
 
-      if (data.status?.name || data.status) {
-        el("gameStatus").textContent = data.status?.name || data.status;
-      }
-
-      if (data.variant?.name || data.variant) {
-        el("variant").textContent = data.variant?.name || data.variant;
-      }
-
+      if (data.status?.name || data.status) el("gameStatus").textContent = data.status?.name || data.status;
+      if (data.variant?.name || data.variant) el("variant").textContent = data.variant?.name || data.variant;
       if (data.speed) el("speed").textContent = data.speed;
       if (typeof data.rated === "boolean") el("rated").textContent = data.rated ? "Rated" : "Casual";
       if (data.turns != null) el("moveCount").textContent = String(data.turns);
-      if (data.id) el("gameId").textContent = data.id;
 
-      el("lastMove").textContent = lm;
+      if (data.id) {
+        el("gameId").textContent = data.id;
+        state.gameId = data.id;
+      }
+
+      el("lastMove").textContent = lm || "—";
       el("updatedAt").textContent = new Date().toLocaleTimeString();
       el("liveState").textContent = "Streaming";
 
-      if (fen) evalIfChanged(fen);
+      if (fen) {
+        evalIfChanged(fen).finally(() => queueWinPrediction(data));
+      } else {
+        queueWinPrediction(data);
+      }
     }
 
     async function streamGame(gameId) {
       if (state.streamAbort) state.streamAbort.abort();
       state.streamAbort = new AbortController();
+
       el("liveState").textContent = "Streaming";
 
       const res = await fetch(`https://lichess.org/api/stream/game/${gameId}`, {
@@ -771,13 +1021,26 @@
 
     async function start() {
       el("gameStatus").textContent = "Locating classical TV game";
+      paintWinPredictor(DEFAULT_PROBS_FALLBACK, "Waiting for model data");
 
       try {
         const gameId = await getClassicalGame();
         state.gameId = gameId;
         state.playersLoaded = false;
         state.lastFen = null;
+        state.lastWinPredKey = null;
+        state.latestEvalCp = null;
+        state.latestEvalMate = null;
         el("gameId").textContent = gameId;
+
+        try {
+          await ensurePg();
+          el("winPredText").textContent = "Prediction database connected";
+        } catch (dbErr) {
+          const probs = fallbackWinPredictor();
+          paintWinPredictor(probs, `Fallback model: ${dbErr.message}`);
+        }
+
         await streamGame(gameId);
         el("liveState").textContent = "Ended";
       } catch (err) {
@@ -786,7 +1049,15 @@
       }
     }
 
+    window.addEventListener("beforeunload", async () => {
+      try {
+        if (state.streamAbort) state.streamAbort.abort();
+        if (state.pgClient) await state.pgClient.end();
+      } catch {}
+    });
+
     el("refreshBtn").addEventListener("click", start);
+
     start();
   </script>
 </body>
