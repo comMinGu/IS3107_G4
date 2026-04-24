@@ -561,15 +561,15 @@
             </div>
 
             <div class="winpred-bar" aria-label="White win draw black win prediction">
-              <div class="seg seg-white" id="winWhite" style="width:17%"></div>
-              <div class="seg seg-draw" id="winDraw" style="width:70%"></div>
-              <div class="seg seg-black" id="winBlack" style="width:13%"></div>
+              <div class="seg seg-white" id="winWhite" style="width:33.33%"></div>
+              <div class="seg seg-draw" id="winDraw" style="width:33.34%"></div>
+              <div class="seg seg-black" id="winBlack" style="width:33.33%"></div>
             </div>
 
             <div class="winpred-meta">
-              <span id="winWhiteLabel">White 17%</span>
-              <span id="winDrawLabel">Draw 70%</span>
-              <span id="winBlackLabel">Black 13%</span>
+              <span id="winWhiteLabel">White 33%</span>
+              <span id="winDrawLabel">Draw 33%</span>
+              <span id="winBlackLabel">Black 33%</span>
             </div>
           </div>
 
@@ -620,10 +620,11 @@
 
   <script>
     const API_BASE = "https://chess-win-predictor-api-547168098912.us-central1.run.app";
-    const DEFAULT_PROBS_FALLBACK = {
-      white_win: 0.17,
-      draw: 0.7,
-      black_win: 0.13,
+
+    const INITIAL_PROBS = {
+      white_win: 0.3333,
+      draw: 0.3334,
+      black_win: 0.3333,
     };
 
     const state = {
@@ -716,7 +717,7 @@
       const black = clamp01(probs?.black_win);
       const total = white + draw + black;
 
-      if (total <= 0) return DEFAULT_PROBS_FALLBACK;
+      if (total <= 0) return INITIAL_PROBS;
 
       return {
         white_win: white / total,
@@ -872,7 +873,9 @@
         state.latestEvalCp = e.cp;
         state.latestEvalMate = e.mate;
         paintEval(e.cp, e.mate);
-        if (e.depth != null) el("evalText").textContent = `${el("evalText").textContent} · depth ${e.depth}`;
+        if (e.depth != null) {
+          el("evalText").textContent = `${el("evalText").textContent} · depth ${e.depth}`;
+        }
       } catch (err) {
         state.latestEvalCp = null;
         state.latestEvalMate = null;
@@ -887,8 +890,9 @@
       getWinPrediction(data.id, data.turns)
         .then(row => {
           if (!row) return;
+
           paintWinPredictor(
-            row.probabilities ?? DEFAULT_PROBS_FALLBACK,
+            row.probabilities ?? fallbackWinPredictor(),
             row.predicted_label ? `Model: ${row.predicted_label}` : "Model data loaded"
           );
         })
@@ -994,7 +998,7 @@
 
     async function start() {
       el("gameStatus").textContent = "Locating classical TV game";
-      paintWinPredictor(DEFAULT_PROBS_FALLBACK, "Waiting for model data");
+      paintWinPredictor(INITIAL_PROBS, "Waiting for model data");
 
       try {
         const gameId = await getClassicalGame();
@@ -1004,6 +1008,10 @@
         state.lastWinPredKey = null;
         state.latestEvalCp = null;
         state.latestEvalMate = null;
+        state.whiteRating = null;
+        state.blackRating = null;
+        state.whiteClock = null;
+        state.blackClock = null;
         el("gameId").textContent = gameId;
 
         await streamGame(gameId);
