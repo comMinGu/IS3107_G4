@@ -12,7 +12,7 @@ from flask_socketio import SocketIO
 try:
     import torch
     import torch.nn as nn
-except Exception:  # pragma: no cover - allows app startup without torch installed
+except Exception:
     torch = None
     nn = None
 
@@ -20,18 +20,8 @@ except Exception:  # pragma: no cover - allows app startup without torch install
 LICHESS_TV_FEED_URL = "https://lichess.org/api/tv/feed"
 
 PIECE_TO_LAYER = {
-    "P": 0,
-    "N": 1,
-    "B": 2,
-    "R": 3,
-    "Q": 4,
-    "K": 5,
-    "p": 6,
-    "n": 7,
-    "b": 8,
-    "r": 9,
-    "q": 10,
-    "k": 11,
+    "P": 0, "N": 1, "B": 2, "R": 3, "Q": 4, "K": 5,
+    "p": 6, "n": 7, "b": 8, "r": 9, "q": 10, "k": 11,
 }
 
 
@@ -66,12 +56,8 @@ class HeuristicFallbackModel:
     def predict(bitboard: np.ndarray, fen: str) -> np.ndarray:
         board = chess.Board(fen)
         values = {
-            chess.PAWN: 1,
-            chess.KNIGHT: 3,
-            chess.BISHOP: 3,
-            chess.ROOK: 5,
-            chess.QUEEN: 9,
-            chess.KING: 0,
+            chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3,
+            chess.ROOK: 5, chess.QUEEN: 9, chess.KING: 0,
         }
         score = 0
         for piece_type, value in values.items():
@@ -80,7 +66,6 @@ class HeuristicFallbackModel:
                 - len(board.pieces(piece_type, chess.BLACK))
             )
 
-        # Convert material score into rough probabilities.
         white = 0.34 + max(min(score / 40.0, 0.35), -0.35)
         black = 0.34 - max(min(score / 40.0, 0.35), -0.35)
         draw = max(0.1, 1.0 - (white + black))
@@ -90,16 +75,13 @@ class HeuristicFallbackModel:
 
 
 def fen_to_bitboard_tensor(fen: str) -> np.ndarray:
-    """Converts FEN into [12, 8, 8] one-hot bitboard layers."""
     board = chess.Board(fen)
     planes = np.zeros((12, 8, 8), dtype=np.float32)
-
     for square, piece in board.piece_map().items():
         layer = PIECE_TO_LAYER[piece.symbol()]
         rank = 7 - chess.square_rank(square)
         file_ = chess.square_file(square)
         planes[layer, rank, file_] = 1.0
-
     return planes
 
 
@@ -109,137 +91,30 @@ def softmax(logits: np.ndarray) -> np.ndarray:
     return exp / np.sum(exp)
 
 
-def extract_players(payload: Dict) -> Tuple[str, str]:
+def extract_players_from_d(d: Dict) -> Tuple[str, str]:
+    """Extract player names from the 'd' payload of a featured message."""
     white = "White"
     black = "Black"
-
-    def format_player(player_obj: Dict) -> Optional[str]:
-        if not isinstance(player_obj, dict):
-            return None
-        user = player_obj.get("user", {})
-        title = ""
-        name = ""
-        rating = player_obj.get("rating")
-
-        if isinstance(user, dict):
-            title = user.get("title") or ""
-            name = user.get("name") or user.get("username") or ""
-
-        if not name:
-            name = player_obj.get("name") or player_obj.get("username") or ""
-        if not name:
-            return None
-
-        display = f"{title} {name}".strip()
-        if isinstance(rating, int):
-            display = f"{display} ({rating})"
-        return display
-
-    if isinstance(payload.get("white"), dict):
-        white = payload["white"].get("name") or payload["white"].get("username") or white
-    elif isinstance(payload.get("white"), str):
-        white = payload.get("white", white)
-
-    if isinstance(payload.get("black"), dict):
-        black = payload["black"].get("name") or payload["black"].get("username") or black
-    elif isinstance(payload.get("black"), str):
-        black = payload.get("black", black)
-
-    players = payload.get("players", {})
-    if isinstance(players, dict):
-        if isinstance(players.get("white"), dict):
-            white = (
-                players["white"].get("name")
-                or players["white"].get("username")
-                or white
-            )
-        if isinstance(players.get("black"), dict):
-            black = (
-                players["black"].get("name")
-                or players["black"].get("username")
-                or black
-            )
-    elif isinstance(players, list):
-        for player in players:
-            if not isinstance(player, dict):
-                continue
-            color = player.get("color")
-            formatted = format_player(player)
-            if color == "white" and formatted:
-                white = formatted
-            elif color == "black" and formatted:
-                black = formatted
-
-    if isinstance(payload.get("d"), dict):
-        nested_white, nested_black = extract_players(payload["d"])
-        white = nested_white or white
-        black = nested_black or black
-
-    return white, black
-
-
-def extract_fen(payload: Dict) -> Optional[str]:
-    possible_keys = ["fen", "lastFen", "currentFen"]
-    for key in possible_keys:
-        if key in payload and isinstance(payload[key], str) and "/" in payload[key]:
-            return payload[key]
-
-    for key in ["d", "data", "move", "state"]:
-        if isinstance(payload.get(key), dict):
-            nested = extract_fen(payload[key])
-            if nested:
-                return nested
-
-    return None
-
-
-def extract_game_id(payload: Dict) -> Optional[str]:
-    possible_keys = ["id", "gameId", "game_id"]
-    for key in possible_keys:
-        if key in payload and isinstance(payload[key], str) and payload[key]:
-            return payload[key]
-
-    for key in ["d", "data", "game", "state", "move"]:
-        if isinstance(payload.get(key), dict):
-            nested = extract_game_id(payload[key])
-            if nested:
-                return nested
-
-    return None
-
-
-def extract_clocks(payload: Dict) -> Tuple[Optional[int], Optional[int]]:
-    white_clock = None
-    black_clock = None
-
-    if isinstance(payload.get("wc"), int):
-        white_clock = payload["wc"]
-    if isinstance(payload.get("bc"), int):
-        black_clock = payload["bc"]
-
-    players = payload.get("players")
+    players = d.get("players", [])
     if isinstance(players, list):
         for player in players:
             if not isinstance(player, dict):
                 continue
             color = player.get("color")
-            seconds = player.get("seconds")
-            if not isinstance(seconds, int):
+            user = player.get("user", {})
+            title = user.get("title", "") if isinstance(user, dict) else ""
+            name = user.get("name", "") if isinstance(user, dict) else ""
+            rating = player.get("rating")
+            if not name:
                 continue
+            display = f"{title} {name}".strip() if title else name
+            if isinstance(rating, int):
+                display = f"{display} ({rating})"
             if color == "white":
-                white_clock = seconds
+                white = display
             elif color == "black":
-                black_clock = seconds
-
-    for key in ["d", "data", "game", "state", "move"]:
-        if isinstance(payload.get(key), dict):
-            nested_white, nested_black = extract_clocks(payload[key])
-            if nested_white is not None:
-                white_clock = nested_white
-            if nested_black is not None:
-                black_clock = nested_black
-
-    return white_clock, black_clock
+                black = display
+    return white, black
 
 
 class PredictorService:
@@ -254,15 +129,13 @@ class PredictorService:
 
     def predict(self, fen: str) -> Dict[str, float]:
         bitboard = fen_to_bitboard_tensor(fen)
-
         if self.use_torch:
             with torch.no_grad():
-                x = torch.from_numpy(bitboard).unsqueeze(0)  # [1, 12, 8, 8]
+                x = torch.from_numpy(bitboard).unsqueeze(0)
                 logits = self.model(x).squeeze(0).numpy()
                 probs = softmax(logits)
         else:
             probs = self.model.predict(bitboard, fen)
-
         return {
             "white": float(probs[0]),
             "draw": float(probs[1]),
@@ -312,8 +185,8 @@ def stream_lichess_tv_feed() -> None:
     headers = {"Accept": "application/x-ndjson"}
     backoff_seconds = 2
     current_game_id: Optional[str] = None
-    current_white_name = "Player 1"
-    current_black_name = "Player 2"
+    current_white_name = "White"
+    current_black_name = "Black"
     current_white_clock: Optional[int] = None
     current_black_clock: Optional[int] = None
 
@@ -327,46 +200,67 @@ def stream_lichess_tv_feed() -> None:
             ) as response:
                 response.raise_for_status()
                 backoff_seconds = 2
+                print("[stream] Connected to Lichess TV feed.")
 
                 for raw_line in response.iter_lines(decode_unicode=True):
                     if not raw_line:
                         continue
-                    payload = json.loads(raw_line)
-                    fen = extract_fen(payload)
-                    if not fen:
+
+                    try:
+                        payload = json.loads(raw_line)
+                    except json.JSONDecodeError:
                         continue
 
-                    game_id = extract_game_id(payload)
-                    if game_id and game_id != current_game_id:
-                        current_game_id = game_id
-                        current_white_name = "Player 1"
-                        current_black_name = "Player 2"
-                        current_white_clock = None
-                        current_black_clock = None
+                    msg_type = payload.get("t")
+                    d = payload.get("d", {})
 
-                    white_name, black_name = extract_players(payload)
-                    if white_name and white_name not in ("White", "Player 1"):
-                        current_white_name = white_name
-                    if black_name and black_name not in ("Black", "Player 2"):
-                        current_black_name = black_name
+                    if not isinstance(d, dict):
+                        continue
 
-                    white_clock, black_clock = extract_clocks(payload)
-                    if white_clock is not None:
-                        current_white_clock = white_clock
-                    if black_clock is not None:
-                        current_black_clock = black_clock
+                    # ── featured: new game started ──────────────────────────
+                    if msg_type == "featured":
+                        current_game_id = d.get("id")
+                        current_white_name, current_black_name = extract_players_from_d(d)
+                        # clocks from players list
+                        for player in d.get("players", []):
+                            color = player.get("color")
+                            secs = player.get("seconds")
+                            if color == "white" and isinstance(secs, int):
+                                current_white_clock = secs
+                            elif color == "black" and isinstance(secs, int):
+                                current_black_clock = secs
+                        fen = d.get("fen")
+                        if not fen:
+                            continue
+                        print(f"[stream] New game: {current_white_name} vs {current_black_name} | {current_game_id}")
+
+                    # ── fen: move played ────────────────────────────────────
+                    elif msg_type == "fen":
+                        fen = d.get("fen")
+                        if not fen:
+                            continue
+                        wc = d.get("wc")
+                        bc = d.get("bc")
+                        if isinstance(wc, int):
+                            current_white_clock = wc
+                        if isinstance(bc, int):
+                            current_black_clock = bc
+                        print(f"[stream] Move | W:{current_white_clock}s B:{current_black_clock}s | fen: {fen[:40]}...")
+
+                    else:
+                        continue
 
                     emit_position(
                         fen,
                         current_white_name,
                         current_black_name,
-                        game_id or current_game_id,
+                        current_game_id,
                         current_white_clock,
                         current_black_clock,
                     )
 
         except Exception as exc:
-            print(f"[stream] reconnecting after error: {exc}")
+            print(f"[stream] Reconnecting after error: {exc}")
             time.sleep(backoff_seconds)
             backoff_seconds = min(backoff_seconds * 2, 30)
 
@@ -378,6 +272,7 @@ def on_connect():
         if not stream_started:
             socketio.start_background_task(stream_lichess_tv_feed)
             stream_started = True
+    print("[socket] Client connected.")
 
 
 if __name__ == "__main__":
