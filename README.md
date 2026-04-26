@@ -12,7 +12,7 @@ The operational ML retraining flow lives outside the main ETL pipeline for now.
 - Artifact output: `artifacts/chess_win_model_bundle.pkl`
 - Baseline notebook reference: `ml_model.ipynb` -> Same logic as train_chess_model.py, but for better readability for viewers (py file is just converted version of this ipynb file)
 
-urrent production feature set:
+Current production feature set:
 
 - `eval_cp_clipped`
 - `elo_diff`
