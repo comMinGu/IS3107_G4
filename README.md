@@ -10,9 +10,9 @@ The operational ML retraining flow lives outside the main ETL pipeline for now.
 - Airflow DAG: `dags/monthly_ml_retrain_dag.py`
 - DAG id: `monthly_chess_model_retraining`
 - Artifact output: `artifacts/chess_win_model_bundle.pkl`
-- Baseline notebook reference: `ml_model.ipynb`
+- Baseline notebook reference: `ml_model.ipynb` -> Same logic as train_chess_model.py, but for better readability for viewers (py file is just converted version of this ipynb file)
 
-Current production feature set:
+urrent production feature set:
 
 - `eval_cp_clipped`
 - `elo_diff`
